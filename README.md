@@ -1,71 +1,17 @@
 # YouTube to MP3 Batch Converter
 
-A Windows app for converting multiple permitted YouTube links into MP3 files in one batch.
+A small local web app for converting multiple YouTube links to MP3 files in one batch.
 
 Use this only for videos you own, public-domain content, Creative Commons content, or material you have permission to download.
 
-## Downloadable App
-
-The standalone Windows app is:
-
-```text
-dist\YoutubeConverter.exe
-```
-
-You can send only this `.exe` file to another Windows computer. No extra folder, Python install, `yt-dlp`, or FFmpeg setup is required because the build bundles the needed tools into the executable.
-
-When opened, the app starts a local server and automatically opens:
-
-```text
-http://127.0.0.1:8080
-```
-
-Keep the small black app window open while converting. Closing that window stops the app.
-
-Converted MP3 files are saved in a `downloads` folder beside the executable.
-
-## Features
-
-- Batch conversion: paste one YouTube URL per line.
-- Live link counter.
-- Clear all links button.
-- Queue status for each conversion.
-- Individual MP3 download buttons.
-- Download ZIP button for completed files.
-- App icon from `icon\100.ico`.
-
-## Build The App
-
-From PowerShell:
-
-```powershell
-.\build_app.ps1
-```
-
-If PowerShell blocks the script:
-
-```powershell
-Set-ExecutionPolicy -Scope Process Bypass
-.\build_app.ps1
-```
-
-The build output is:
-
-```text
-dist\YoutubeConverter.exe
-```
-
-The executable includes `ffmpeg.exe` and `ffprobe.exe` when they exist in the local `bin` folder.
-
-## Run From Source
-
-Requirements:
+## Requirements
 
 - Python 3.10 or newer
-- FFmpeg installed and available on `PATH`
+- `ffmpeg` installed and available on your `PATH`
+- Node.js 22 or newer, used by yt-dlp to solve YouTube JavaScript challenges
 - Python dependencies from `requirements.txt`
 
-Setup:
+## Setup
 
 ```powershell
 python -m venv .venv
@@ -73,26 +19,57 @@ python -m venv .venv
 python -m pip install -r requirements.txt
 ```
 
-Install FFmpeg if needed:
+Install `ffmpeg` if it is not already available:
 
 ```powershell
 winget install Gyan.FFmpeg
 ```
 
-Run:
+Close and reopen PowerShell after installing `ffmpeg`, then check:
+
+```powershell
+ffmpeg -version
+```
+
+If Windows still cannot find `ffmpeg`, add this folder to your user `Path`:
+
+```text
+C:\Users\Nitro\AppData\Local\Microsoft\WinGet\Links
+```
+
+Then close and reopen your terminal and restart `python app.py`.
+
+## Run
 
 ```powershell
 python app.py
 ```
 
-Then open:
+The converter automatically opens this address in your default browser:
 
 ```text
 http://127.0.0.1:8080
 ```
 
+Paste one YouTube URL per line, click **Convert Batch**, and wait for each item to become ready. Converted files are stored in the local `downloads/` folder and can also be downloaded from the browser UI.
+
+## YouTube Cookies
+
+Some YouTube requests require authentication. Export your own YouTube cookies in Netscape format, name the file `cookies.txt`, and put it beside `app.py`:
+
+```text
+Youtube_Converter\
+|-- app.py
+|-- cookies.txt
+|-- requirements.txt
+```
+
+Restart `python app.py` after adding or replacing the file. The program detects it automatically and passes it to `yt-dlp`.
+
+Never share `cookies.txt` or commit it to GitHub. It contains private session information and is excluded by `.gitignore`.
+
 ## Notes
 
 - Batches are limited to 50 links.
 - The app downloads only the individual video URL you paste, not an entire playlist.
-- Two conversions run at the same time by default. Change `MAX_WORKERS` in `app.py` to adjust this.
+- Two conversions run at the same time by default. You can change `MAX_WORKERS` in `app.py`.

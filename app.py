@@ -4,10 +4,12 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import sys
 import threading
 import time
 import uuid
+import webbrowser
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
@@ -18,23 +20,12 @@ from typing import Any
 from urllib.parse import quote, unquote, urlparse
 
 
-def application_dir() -> Path:
-    if getattr(sys, "frozen", False):
-        return Path(sys.executable).resolve().parent
-    return Path(__file__).resolve().parent
-
-
-APP_DIR = application_dir()
-RESOURCE_DIR = Path(getattr(sys, "_MEIPASS", APP_DIR))
+APP_DIR = Path(__file__).resolve().parent
 DOWNLOAD_DIR = APP_DIR / "downloads"
 MAX_BATCH_SIZE = 50
 MAX_WORKERS = 2
 SERVER_HOST = "127.0.0.1"
 SERVER_PORT = 8080
-CONTENT_TYPES = {
-    ".mp3": "audio/mpeg",
-    ".zip": "application/zip",
-}
 
 
 @dataclass
@@ -62,15 +53,16 @@ jobs_lock = threading.Lock()
 executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
 
 
-def ffmpeg_location() -> str | None:
-    for root in (APP_DIR, RESOURCE_DIR):
-        for candidate in (root / "bin" / "ffmpeg.exe", root / "ffmpeg.exe"):
-            try:
-                if candidate.exists():
-                    return str(candidate.parent)
-            except OSError:
-                continue
+def yt_dlp_command() -> list[str] | None:
+    try:
+        import yt_dlp  # noqa: F401
+    except ImportError:
+        return None
 
+    return [sys.executable, "-m", "yt_dlp"]
+
+
+def ffmpeg_location() -> str | None:
     ffmpeg = shutil.which("ffmpeg")
     if ffmpeg:
         return str(Path(ffmpeg).parent)
@@ -137,8 +129,7 @@ def snapshot_job(job: BatchJob) -> dict[str, Any]:
 
         item_data = asdict(item)
         item_data["downloadUrls"] = [
-            f"/api/download/{job.id}/{item.id}/{quote(filename, safe='')}"
-            for filename in item.files
+            f"/api/download/{job.id}/{item.id}/{quote(filename)}" for filename in item.files
         ]
         items.append(item_data)
 
@@ -169,88 +160,20 @@ def list_mp3_files(item_dir: Path) -> list[str]:
     return sorted(path.name for path in item_dir.glob("*.mp3") if path.is_file())
 
 
-def friendly_ytdlp_error(message: str) -> str:
-    if "WinError 10013" in message:
-        return (
-            "Windows blocked yt-dlp from connecting to YouTube. Start the app from your "
-            "own terminal and allow python.exe/yt-dlp through your firewall or antivirus."
-        )
-    if "Failed to establish a new connection" in message:
-        return "Could not connect to YouTube. Check your internet, VPN/proxy, or firewall."
-    return message
-
-
-class YtdlpLogger:
-    def debug(self, message: str) -> None:
-        pass
-
-    def info(self, message: str) -> None:
-        pass
-
-    def warning(self, message: str) -> None:
-        pass
-
-    def error(self, message: str) -> None:
-        pass
-
-
-def ytdlp_options(
-    batch_id: str,
-    item_id: str,
-    item_dir: Path,
-    ffmpeg_path: str,
-) -> dict[str, Any]:
-    def progress_hook(data: dict[str, Any]) -> None:
-        status = data.get("status")
-        filename = data.get("filename")
-        if filename:
-            set_item_state(batch_id, item_id, title=Path(filename).stem)
-
-        if status == "downloading":
-            percent = re.sub(r"\x1b\[[0-9;]*m", "", str(data.get("_percent_str", ""))).strip()
-            speed = re.sub(r"\x1b\[[0-9;]*m", "", str(data.get("_speed_str", ""))).strip()
-            parts = [part for part in (percent, speed) if part and part != "Unknown B/s"]
-            set_item_state(
-                batch_id,
-                item_id,
-                message="Downloading" + (f" {' at '.join(parts)}" if parts else ""),
-                progress=percent if percent.endswith("%") else "",
-            )
-        elif status == "finished":
-            set_item_state(batch_id, item_id, message="Post-processing")
-
-    return {
-        "outtmpl": str(item_dir / "%(title).180B [%(id)s].%(ext)s"),
-        "noplaylist": True,
-        "quiet": True,
-        "no_warnings": True,
-        "windowsfilenames": True,
-        "ffmpeg_location": ffmpeg_path,
-        "force_ipv4": True,
-        "socket_timeout": 30,
-        "retries": 3,
-        "fragment_retries": 3,
-        "logger": YtdlpLogger(),
-        "progress_hooks": [progress_hook],
-        "format": "bestaudio/best",
-        "postprocessors": [
-            {
-                "key": "FFmpegExtractAudio",
-                "preferredcodec": "mp3",
-                "preferredquality": "0",
-            },
-            {"key": "FFmpegMetadata"},
-        ],
-    }
+def cookies_file() -> Path | None:
+    candidate = APP_DIR / "cookies.txt"
+    try:
+        return candidate if candidate.is_file() else None
+    except OSError:
+        return None
 
 
 def run_conversion(batch_id: str, item_id: str, url: str) -> None:
     item_dir = DOWNLOAD_DIR / batch_id / item_id
     item_dir.mkdir(parents=True, exist_ok=True)
 
-    try:
-        import yt_dlp
-    except ImportError:
+    command_prefix = yt_dlp_command()
+    if command_prefix is None:
         set_item_state(
             batch_id,
             item_id,
@@ -271,6 +194,31 @@ def run_conversion(batch_id: str, item_id: str, url: str) -> None:
         )
         return
 
+    output_template = str(item_dir / "%(title).180B [%(id)s].%(ext)s")
+    command = [
+        *command_prefix,
+        "--newline",
+        "--no-playlist",
+        "--no-mtime",
+        "--extract-audio",
+        "--audio-format",
+        "mp3",
+        "--audio-quality",
+        "0",
+        "--ffmpeg-location",
+        ffmpeg_path,
+        "--add-metadata",
+        "--output",
+        output_template,
+    ]
+    node_path = shutil.which("node")
+    if node_path:
+        command.extend(["--js-runtimes", f"node:{node_path}"])
+    cookie_path = cookies_file()
+    if cookie_path:
+        command.extend(["--cookies", str(cookie_path)])
+    command.append(url)
+
     set_item_state(
         batch_id,
         item_id,
@@ -280,12 +228,41 @@ def run_conversion(batch_id: str, item_id: str, url: str) -> None:
     )
 
     try:
-        options = ytdlp_options(batch_id, item_id, item_dir, ffmpeg_path)
-        with yt_dlp.YoutubeDL(options) as ydl:
-            ydl.download([url])
+        process = subprocess.Popen(
+            command,
+            cwd=APP_DIR,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
 
+        last_line = ""
+        cookie_required = False
+        assert process.stdout is not None
+        for line in process.stdout:
+            clean = line.strip()
+            if not clean:
+                continue
+            last_line = clean
+            lowered = clean.lower()
+            if "cookies" in lowered or "sign in to confirm" in lowered:
+                cookie_required = True
+
+            title_match = re.search(r"\[download\] Destination: (.+)", clean)
+            if title_match:
+                set_item_state(batch_id, item_id, title=Path(title_match.group(1)).stem)
+
+            progress_match = re.search(r"\[download\]\s+([0-9.]+%)", clean)
+            changes: dict[str, Any] = {"message": clean[-240:]}
+            if progress_match:
+                changes["progress"] = progress_match.group(1)
+            set_item_state(batch_id, item_id, **changes)
+
+        exit_code = process.wait()
         files = list_mp3_files(item_dir)
-        if files:
+        if exit_code == 0 and files:
             set_item_state(
                 batch_id,
                 item_id,
@@ -297,11 +274,23 @@ def run_conversion(batch_id: str, item_id: str, url: str) -> None:
             )
             return
 
+        if cookie_required and cookie_path:
+            reason = (
+                "YouTube rejected cookies.txt. Export fresh YouTube cookies, replace the "
+                "file beside app.py, restart the server, and try again."
+            )
+        elif cookie_required:
+            reason = (
+                "YouTube requires cookies. Export YouTube cookies to cookies.txt, put the "
+                "file beside app.py, restart the server, and try again."
+            )
+        else:
+            reason = last_line or f"yt-dlp exited with code {exit_code}"
         set_item_state(
             batch_id,
             item_id,
             status="error",
-            message="No MP3 file was created.",
+            message=reason[-240:],
             files=files,
             finished_at=time.time(),
         )
@@ -310,7 +299,7 @@ def run_conversion(batch_id: str, item_id: str, url: str) -> None:
             batch_id,
             item_id,
             status="error",
-            message=friendly_ytdlp_error(str(exc))[-240:],
+            message=str(exc),
             finished_at=time.time(),
         )
 
@@ -354,7 +343,7 @@ def build_zip(batch_id: str) -> Path:
         ]
 
     if not item_file_pairs:
-        raise FileNotFoundError("No converted files are ready")
+        raise FileNotFoundError("No converted MP3 files are ready")
 
     batch_dir = DOWNLOAD_DIR / batch_id
     zip_path = batch_dir / "youtube-mp3-batch.zip"
@@ -393,7 +382,7 @@ class AppHandler(BaseHTTPRequestHandler):
         if parsed.path.startswith("/api/download/") and parsed.path.endswith(".zip"):
             batch_id = Path(parsed.path.removeprefix("/api/download/")).stem
             try:
-                self.send_file(build_zip(batch_id), CONTENT_TYPES[".zip"])
+                self.send_file(build_zip(batch_id), "application/zip")
             except FileNotFoundError as exc:
                 self.send_json({"error": str(exc)}, HTTPStatus.NOT_FOUND)
             return
@@ -405,10 +394,7 @@ class AppHandler(BaseHTTPRequestHandler):
                 return
             try:
                 target = safe_lookup_file(parts[0], parts[1], parts[2])
-                self.send_file(
-                    target,
-                    CONTENT_TYPES.get(target.suffix.lower(), "application/octet-stream"),
-                )
+                self.send_file(target, "audio/mpeg")
             except FileNotFoundError as exc:
                 self.send_json({"error": str(exc)}, HTTPStatus.NOT_FOUND)
             return
@@ -440,8 +426,6 @@ class AppHandler(BaseHTTPRequestHandler):
         data = html.encode("utf-8")
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.send_header("Cache-Control", "no-store, max-age=0")
-        self.send_header("Pragma", "no-cache")
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
@@ -450,8 +434,6 @@ class AppHandler(BaseHTTPRequestHandler):
         payload = json.dumps(data).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Cache-Control", "no-store, max-age=0")
-        self.send_header("Pragma", "no-cache")
         self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
         self.wfile.write(payload)
@@ -463,7 +445,7 @@ class AppHandler(BaseHTTPRequestHandler):
         if not ascii_filename:
             ascii_filename = f"download{path.suffix}"
         ascii_filename = ascii_filename.replace("\\", "_").replace("/", "_").replace('"', "")
-        utf8_filename = quote(filename, safe="")
+        utf8_filename = quote(filename)
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(data)))
@@ -984,16 +966,15 @@ INDEX_HTML = r"""<!doctype html>
 """
 
 
-def main(open_browser: bool = False) -> None:
+def main() -> None:
     DOWNLOAD_DIR.mkdir(exist_ok=True)
     server = ThreadingHTTPServer((SERVER_HOST, SERVER_PORT), AppHandler)
     url = f"http://{SERVER_HOST}:{SERVER_PORT}"
-    print(f"Open {url} in your browser")
+    print(f"Opening {url} in your browser")
     print("Press Ctrl+C to stop the converter")
-    if open_browser:
-        import webbrowser
-
-        threading.Timer(1.0, lambda: webbrowser.open(url)).start()
+    browser_timer = threading.Timer(1.0, lambda: webbrowser.open(url))
+    browser_timer.daemon = True
+    browser_timer.start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:

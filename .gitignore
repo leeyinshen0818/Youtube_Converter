@@ -4,7 +4,4 @@ __pycache__/
 venv/
 downloads/
 *.log
-build/
-dist/
-bin/
-*.toc
+cookies.txt
