@@ -204,10 +204,9 @@ def run_conversion(batch_id: str, item_id: str, url: str) -> None:
         "--audio-format",
         "mp3",
         "--audio-quality",
-        "0",
+        "5",
         "--ffmpeg-location",
         ffmpeg_path,
-        "--add-metadata",
         "--output",
         output_template,
     ]
