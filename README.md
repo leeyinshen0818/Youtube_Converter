@@ -6,10 +6,12 @@ Use this only for videos you own, public-domain content, Creative Commons conten
 
 ## Requirements
 
-- Python 3.10 or newer
+- Python 3.10 or newer. Python 3.11+ is recommended because yt-dlp warns that Python 3.10 support is deprecated.
 - `ffmpeg` installed and available on your `PATH`
 - Node.js 22 or newer, used by yt-dlp to solve YouTube JavaScript challenges
 - Python dependencies from `requirements.txt`
+
+This project is a source-only local app. It is intended to be opened in VS Code and run with the project virtual environment. It is not currently packaged as a standalone Windows application.
 
 ## Setup
 
@@ -41,9 +43,21 @@ Then close and reopen your terminal and restart `python app.py`.
 
 ## Run
 
+Recommended:
+
 ```powershell
-python app.py
+.\.venv\Scripts\python.exe app.py
 ```
+
+This makes sure the app uses the project virtual environment and the correct `yt-dlp[default]` installation.
+
+You can also use the VS Code **Run Python Script** button after selecting the project interpreter:
+
+1. Press `Ctrl + Shift + P`
+2. Search `Python: Select Interpreter`
+3. Choose `.\.venv\Scripts\python.exe`
+
+VS Code remembers this interpreter for this project until you change it.
 
 The converter automatically opens this address in your default browser:
 
@@ -68,8 +82,22 @@ Restart `python app.py` after adding or replacing the file. The program detects 
 
 Never share `cookies.txt` or commit it to GitHub. It contains private session information and is excluded by `.gitignore`.
 
+If YouTube starts showing authentication, cookie, or "page needs to be reloaded" errors again, export a fresh `cookies.txt`, replace the old file, and restart the server.
+
+## Speed Notes
+
+Some videos are slower because YouTube now requires extra checks before the media can be downloaded:
+
+```text
+Downloading web creator client config
+[jsc:node] Solving JS challenges using node
+```
+
+Those steps come from `yt-dlp` and YouTube, not from the app UI. Node.js support makes more videos work, but it can make startup slower for each link.
+
 ## Notes
 
 - Batches are limited to 50 links.
 - The app downloads only the individual video URL you paste, not an entire playlist.
 - Two conversions run at the same time by default. You can change `MAX_WORKERS` in `app.py`.
+- Converted files are saved in the local `downloads/` folder.
