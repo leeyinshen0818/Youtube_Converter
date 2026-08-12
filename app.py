@@ -318,6 +318,34 @@ def create_batch(payload: dict[str, Any]) -> dict[str, Any]:
     return snapshot_job(job)
 
 
+def retry_item(batch_id: str, item_id: str) -> dict[str, Any]:
+    with jobs_lock:
+        job = jobs.get(batch_id)
+        if job is None:
+            raise FileNotFoundError("Batch not found")
+
+        item = next((entry for entry in job.items if entry.id == item_id), None)
+        if item is None:
+            raise FileNotFoundError("Queue item not found")
+        if item.status in {"queued", "running"}:
+            raise ValueError("This item is already queued or running")
+
+        item.status = "queued"
+        item.title = ""
+        item.message = "Waiting"
+        item.progress = ""
+        item.files = []
+        item.started_at = None
+        item.finished_at = None
+        url = item.url
+
+    executor.submit(run_conversion, batch_id, item_id, url)
+
+    with jobs_lock:
+        job = jobs[batch_id]
+        return snapshot_job(job)
+
+
 def safe_lookup_file(batch_id: str, item_id: str, filename: str) -> Path:
     filename = Path(unquote(filename)).name
     item_dir = (DOWNLOAD_DIR / batch_id / item_id).resolve()
@@ -402,6 +430,17 @@ class AppHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
+        retry_match = re.fullmatch(r"/api/jobs/([^/]+)/items/([^/]+)/retry", parsed.path)
+        if retry_match:
+            try:
+                data = retry_item(retry_match.group(1), retry_match.group(2))
+                self.send_json(data)
+            except ValueError as exc:
+                self.send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+            except FileNotFoundError as exc:
+                self.send_json({"error": str(exc)}, HTTPStatus.NOT_FOUND)
+            return
+
         if parsed.path != "/api/jobs":
             self.send_json({"error": "Not found"}, HTTPStatus.NOT_FOUND)
             return
@@ -828,7 +867,7 @@ INDEX_HTML = r"""<!doctype html>
             <h2>Queue</h2>
             <div class="stats" id="stats"></div>
           </div>
-          <a class="button top-download" id="zipLink" href="#" hidden>Download ZIP</a>
+          <button class="button top-download" id="downloadAllButton" type="button" hidden>Download All</button>
         </div>
         <div id="items" class="items">
           <div class="empty">
@@ -848,9 +887,10 @@ INDEX_HTML = r"""<!doctype html>
     const errorText = document.querySelector("#errorText");
     const itemsNode = document.querySelector("#items");
     const statsNode = document.querySelector("#stats");
-    const zipLink = document.querySelector("#zipLink");
+    const downloadAllButton = document.querySelector("#downloadAllButton");
     let currentBatchId = "";
     let pollTimer = 0;
+    let latestBatch = null;
 
     textarea.addEventListener("input", updateLinkCount);
     clearLinksButton.addEventListener("click", () => {
@@ -859,6 +899,7 @@ INDEX_HTML = r"""<!doctype html>
       updateLinkCount();
       textarea.focus();
     });
+    downloadAllButton.addEventListener("click", downloadAll);
 
     form.addEventListener("submit", async (event) => {
       event.preventDefault();
@@ -876,6 +917,8 @@ INDEX_HTML = r"""<!doctype html>
         if (!response.ok) throw new Error(data.error || "Unable to start batch");
 
         currentBatchId = data.id;
+        textarea.value = "";
+        updateLinkCount();
         render(data);
         startPolling();
       } catch (error) {
@@ -915,7 +958,43 @@ INDEX_HTML = r"""<!doctype html>
       if (active === 0) clearInterval(pollTimer);
     }
 
+    async function retryItem(itemId) {
+      if (!currentBatchId) return;
+      errorText.textContent = "";
+
+      try {
+        const response = await fetch(`/api/jobs/${currentBatchId}/items/${itemId}/retry`, {
+          method: "POST"
+        });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || "Unable to retry item");
+
+        render(data);
+        startPolling();
+      } catch (error) {
+        errorText.textContent = error.message;
+      }
+    }
+
+    function downloadAll() {
+      if (!latestBatch) return;
+      const urls = latestBatch.items.flatMap((item) => item.downloadUrls || []);
+      if (!urls.length) return;
+
+      urls.forEach((url, index) => {
+        setTimeout(() => {
+          const link = document.createElement("a");
+          link.href = url;
+          link.download = "";
+          document.body.appendChild(link);
+          link.click();
+          link.remove();
+        }, index * 350);
+      });
+    }
+
     function render(data) {
+      latestBatch = data;
       const counts = data.counts;
       statsNode.innerHTML = `
         <span class="stat">${counts.total} total</span>
@@ -924,8 +1003,8 @@ INDEX_HTML = r"""<!doctype html>
         <span class="stat">${counts.error} failed</span>
       `;
 
-      zipLink.hidden = !data.zipUrl;
-      zipLink.href = data.zipUrl || "#";
+      const readyDownloads = data.items.flatMap((item) => item.downloadUrls || []);
+      downloadAllButton.hidden = readyDownloads.length === 0;
 
       itemsNode.innerHTML = data.items.map((item) => {
         const progressValue = Number((item.progress || "0").replace("%", "")) || 0;
@@ -934,6 +1013,9 @@ INDEX_HTML = r"""<!doctype html>
         const downloads = item.downloadUrls.map((url, index) => (
           `<a class="button" href="${url}">Download MP3 ${index + 1}</a>`
         )).join("");
+        const retry = item.status === "error"
+          ? `<button class="button retry-button" type="button" onclick="retryItem('${item.id}')">Retry</button>`
+          : "";
 
         return `
           <article class="item">
@@ -943,7 +1025,7 @@ INDEX_HTML = r"""<!doctype html>
                 <div class="url">${escapeHtml(displayName)}</div>
                 <div class="message">${escapeHtml(item.message || "")}</div>
               </div>
-              <div class="downloads">${downloads}</div>
+              <div class="downloads">${downloads}${retry}</div>
             </div>
             <progress max="100" value="${progressValue}"></progress>
           </article>
