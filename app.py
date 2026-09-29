@@ -4,7 +4,6 @@ import json
 import os
 import re
 import shutil
-import subprocess
 import sys
 import threading
 import time
@@ -20,8 +19,18 @@ from typing import Any
 from urllib.parse import quote, unquote, urlparse
 
 
-APP_DIR = Path(__file__).resolve().parent
-DOWNLOAD_DIR = APP_DIR / "downloads"
+SOURCE_DIR = Path(__file__).resolve().parent
+IS_FROZEN = bool(getattr(sys, "frozen", False))
+BUNDLE_DIR = Path(getattr(sys, "_MEIPASS", SOURCE_DIR))
+if IS_FROZEN:
+    local_app_data = Path(
+        os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local")
+    )
+    APP_DIR = local_app_data / "YouTube MP3 Converter"
+    DOWNLOAD_DIR = Path.home() / "Downloads" / "YouTube MP3 Converter"
+else:
+    APP_DIR = SOURCE_DIR
+    DOWNLOAD_DIR = APP_DIR / "downloads"
 MAX_BATCH_SIZE = 50
 MAX_WORKERS = 2
 SERVER_HOST = "127.0.0.1"
@@ -53,16 +62,11 @@ jobs_lock = threading.Lock()
 executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
 
 
-def yt_dlp_command() -> list[str] | None:
-    try:
-        import yt_dlp  # noqa: F401
-    except ImportError:
-        return None
-
-    return [sys.executable, "-m", "yt_dlp"]
-
-
 def ffmpeg_location() -> str | None:
+    bundled = BUNDLE_DIR / "bin" / "ffmpeg.exe"
+    if bundled.is_file():
+        return str(bundled.parent)
+
     ffmpeg = shutil.which("ffmpeg")
     if ffmpeg:
         return str(Path(ffmpeg).parent)
@@ -172,8 +176,9 @@ def run_conversion(batch_id: str, item_id: str, url: str) -> None:
     item_dir = DOWNLOAD_DIR / batch_id / item_id
     item_dir.mkdir(parents=True, exist_ok=True)
 
-    command_prefix = yt_dlp_command()
-    if command_prefix is None:
+    try:
+        import yt_dlp
+    except ImportError:
         set_item_state(
             batch_id,
             item_id,
@@ -195,28 +200,9 @@ def run_conversion(batch_id: str, item_id: str, url: str) -> None:
         return
 
     output_template = str(item_dir / "%(title).180B [%(id)s].%(ext)s")
-    command = [
-        *command_prefix,
-        "--newline",
-        "--no-playlist",
-        "--no-mtime",
-        "--extract-audio",
-        "--audio-format",
-        "mp3",
-        "--audio-quality",
-        "5",
-        "--ffmpeg-location",
-        ffmpeg_path,
-        "--output",
-        output_template,
-    ]
-    node_path = shutil.which("node")
-    if node_path:
-        command.extend(["--js-runtimes", f"node:{node_path}"])
+    bundled_node = BUNDLE_DIR / "bin" / "node.exe"
+    node_path = str(bundled_node) if bundled_node.is_file() else shutil.which("node")
     cookie_path = cookies_file()
-    if cookie_path:
-        command.extend(["--cookies", str(cookie_path)])
-    command.append(url)
 
     set_item_state(
         batch_id,
@@ -226,42 +212,92 @@ def run_conversion(batch_id: str, item_id: str, url: str) -> None:
         started_at=time.time(),
     )
 
-    try:
-        process = subprocess.Popen(
-            command,
-            cwd=APP_DIR,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-        )
+    last_line = ""
+    cookie_required = False
 
-        last_line = ""
-        cookie_required = False
-        assert process.stdout is not None
-        for line in process.stdout:
-            clean = line.strip()
-            if not clean:
-                continue
-            last_line = clean
-            lowered = clean.lower()
-            if "cookies" in lowered or "sign in to confirm" in lowered:
-                cookie_required = True
+    def clean_message(message: Any) -> str:
+        return re.sub(r"\x1b\[[0-9;]*m", "", str(message)).strip()
 
-            title_match = re.search(r"\[download\] Destination: (.+)", clean)
-            if title_match:
-                set_item_state(batch_id, item_id, title=Path(title_match.group(1)).stem)
+    def record_message(message: Any) -> None:
+        nonlocal last_line, cookie_required
+        clean = clean_message(message)
+        if not clean:
+            return
+        last_line = clean
+        lowered = clean.lower()
+        if "cookies" in lowered or "sign in to confirm" in lowered:
+            cookie_required = True
+        set_item_state(batch_id, item_id, message=clean[-240:])
 
-            progress_match = re.search(r"\[download\]\s+([0-9.]+%)", clean)
-            changes: dict[str, Any] = {"message": clean[-240:]}
-            if progress_match:
-                changes["progress"] = progress_match.group(1)
+    class QueueLogger:
+        def debug(self, message: Any) -> None:
+            if not str(message).startswith("[debug]"):
+                record_message(message)
+
+        def info(self, message: Any) -> None:
+            record_message(message)
+
+        def warning(self, message: Any) -> None:
+            record_message(message)
+
+        def error(self, message: Any) -> None:
+            record_message(message)
+
+    def progress_hook(data: dict[str, Any]) -> None:
+        info = data.get("info_dict") or {}
+        title = str(info.get("title") or "")
+        status = data.get("status")
+        if status == "downloading":
+            percent = clean_message(data.get("_percent_str") or "")
+            changes: dict[str, Any] = {
+                "message": f"Downloading {percent}".strip(),
+            }
+            match = re.search(r"([0-9.]+%)", percent)
+            if match:
+                changes["progress"] = match.group(1)
+            if title:
+                changes["title"] = title
             set_item_state(batch_id, item_id, **changes)
+        elif status == "finished":
+            set_item_state(
+                batch_id,
+                item_id,
+                title=title,
+                message="Converting to MP3",
+                progress="100%",
+            )
 
-        exit_code = process.wait()
+    def postprocessor_hook(data: dict[str, Any]) -> None:
+        if data.get("status") == "started":
+            set_item_state(batch_id, item_id, message="Converting to MP3")
+
+    options: dict[str, Any] = {
+        "format": "bestaudio/best",
+        "noplaylist": True,
+        "updatetime": False,
+        "outtmpl": output_template,
+        "ffmpeg_location": ffmpeg_path,
+        "logger": QueueLogger(),
+        "progress_hooks": [progress_hook],
+        "postprocessor_hooks": [postprocessor_hook],
+        "postprocessors": [
+            {
+                "key": "FFmpegExtractAudio",
+                "preferredcodec": "mp3",
+                "preferredquality": "5",
+            }
+        ],
+    }
+    if node_path:
+        options["js_runtimes"] = {"node": {"path": node_path}}
+    if cookie_path:
+        options["cookiefile"] = str(cookie_path)
+
+    try:
+        with yt_dlp.YoutubeDL(options) as downloader:
+            downloader.extract_info(url, download=True)
         files = list_mp3_files(item_dir)
-        if exit_code == 0 and files:
+        if files:
             set_item_state(
                 batch_id,
                 item_id,
@@ -272,33 +308,26 @@ def run_conversion(batch_id: str, item_id: str, url: str) -> None:
                 finished_at=time.time(),
             )
             return
-
+        raise RuntimeError(last_line or "Conversion finished without creating an MP3 file")
+    except Exception as exc:  # pragma: no cover - defensive background task guard
         if cookie_required and cookie_path:
             reason = (
                 "YouTube rejected cookies.txt. Export fresh YouTube cookies, replace the "
-                "file beside app.py, restart the server, and try again."
+                "file, restart the app, and try again."
             )
         elif cookie_required:
             reason = (
-                "YouTube requires cookies. Export YouTube cookies to cookies.txt, put the "
-                "file beside app.py, restart the server, and try again."
+                "YouTube requires cookies. Export YouTube cookies to cookies.txt, add the "
+                "file to the app data folder, restart the app, and try again."
             )
         else:
-            reason = last_line or f"yt-dlp exited with code {exit_code}"
+            reason = last_line or str(exc)
         set_item_state(
             batch_id,
             item_id,
             status="error",
             message=reason[-240:],
-            files=files,
-            finished_at=time.time(),
-        )
-    except Exception as exc:  # pragma: no cover - defensive background task guard
-        set_item_state(
-            batch_id,
-            item_id,
-            status="error",
-            message=str(exc),
+            files=list_mp3_files(item_dir),
             finished_at=time.time(),
         )
 
@@ -1048,14 +1077,55 @@ INDEX_HTML = r"""<!doctype html>
 
 
 def main() -> None:
-    DOWNLOAD_DIR.mkdir(exist_ok=True)
-    server = ThreadingHTTPServer((SERVER_HOST, SERVER_PORT), AppHandler)
-    url = f"http://{SERVER_HOST}:{SERVER_PORT}"
+    APP_DIR.mkdir(parents=True, exist_ok=True)
+    DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        server = ThreadingHTTPServer((SERVER_HOST, SERVER_PORT), AppHandler)
+    except OSError:
+        server = ThreadingHTTPServer((SERVER_HOST, 0), AppHandler)
+    port = int(server.server_address[1])
+    url = f"http://{SERVER_HOST}:{port}"
     print(f"Opening {url} in your browser")
     print("Press Ctrl+C to stop the converter")
     browser_timer = threading.Timer(1.0, lambda: webbrowser.open(url))
     browser_timer.daemon = True
     browser_timer.start()
+
+    if IS_FROZEN:
+        try:
+            import pystray
+            from PIL import Image
+
+            tray_image = Image.open(BUNDLE_DIR / "icon" / "icon1.png")
+
+            def open_converter(icon: Any = None, item: Any = None) -> None:
+                webbrowser.open(url)
+
+            def open_downloads(icon: Any = None, item: Any = None) -> None:
+                os.startfile(DOWNLOAD_DIR)  # type: ignore[attr-defined]
+
+            def exit_converter(icon: Any, item: Any = None) -> None:
+                icon.stop()
+
+            server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+            server_thread.start()
+            tray = pystray.Icon(
+                "youtube_mp3_converter",
+                tray_image,
+                "YouTube MP3 Converter",
+                menu=pystray.Menu(
+                    pystray.MenuItem("Open Converter", open_converter, default=True),
+                    pystray.MenuItem("Open Downloads", open_downloads),
+                    pystray.MenuItem("Exit", exit_converter),
+                ),
+            )
+            tray.run()
+            server.shutdown()
+            server_thread.join(timeout=3)
+            return
+        except Exception as exc:
+            print(f"Tray icon unavailable: {exc}")
+
     try:
         server.serve_forever()
     except KeyboardInterrupt:

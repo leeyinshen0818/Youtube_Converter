@@ -11,7 +11,7 @@ Use this only for videos you own, public-domain content, Creative Commons conten
 - Node.js 22 or newer, used by yt-dlp to solve YouTube JavaScript challenges
 - Python dependencies from `requirements.txt`
 
-This project is a source-only local app. It is intended to be opened in VS Code and run with the project virtual environment. It is not currently packaged as a standalone Windows application.
+The project can run from source in VS Code or be packaged as a single standalone Windows application.
 
 ## Setup
 
@@ -67,6 +67,30 @@ http://127.0.0.1:8080
 
 Paste one YouTube URL per line, click **Convert Batch**, and wait for each item to become ready. Converted files are stored in the local `downloads/` folder and can also be downloaded from the browser UI.
 
+## Standalone Windows App
+
+The standalone build is one `.exe` file. It embeds yt-dlp, FFmpeg, FFprobe, Node.js, and the logo from `icon/icon1.png`, so the recipient does not need Python or separate runtime files.
+
+Build it on Windows from PowerShell:
+
+```powershell
+.\build_windows.ps1
+```
+
+The finished application is created here:
+
+```text
+dist\YouTubeMP3Converter.exe
+```
+
+You can move that `.exe` by itself to the Desktop or send that single file to another Windows computer. On first launch, Windows may take a little longer while the one-file package extracts its embedded tools. The app opens in the default browser and remains available from the system tray. Use the tray menu to reopen the converter, open the download folder, or exit.
+
+Standalone downloads are stored in:
+
+```text
+%USERPROFILE%\Downloads\YouTube MP3 Converter
+```
+
 ## YouTube Cookies
 
 Some YouTube requests require authentication. Export your own YouTube cookies in Netscape format, name the file `cookies.txt`, and put it beside `app.py`:
@@ -79,6 +103,14 @@ Youtube_Converter\
 ```
 
 Restart `python app.py` after adding or replacing the file. The program detects it automatically and passes it to `yt-dlp`.
+
+For the standalone app, launch it once and put the optional cookie file here instead:
+
+```text
+%LOCALAPPDATA%\YouTube MP3 Converter\cookies.txt
+```
+
+The cookie file is not required for ordinary public videos. It is only needed when YouTube requires your authenticated session, and it must never be sent to another person with the app.
 
 Never share `cookies.txt` or commit it to GitHub. It contains private session information and is excluded by `.gitignore`.
 

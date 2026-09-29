@@ -5,3 +5,7 @@ venv/
 downloads/
 *.log
 cookies.txt
+.build-assets/
+build/
+dist/
+*.spec
