@@ -35,7 +35,7 @@ MAX_BATCH_SIZE = 50
 MAX_WORKERS = 2
 SERVER_HOST = "127.0.0.1"
 SERVER_PORT = 8080
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 
 
 @dataclass
@@ -425,6 +425,12 @@ class AppHandler(BaseHTTPRequestHandler):
             self.send_html(INDEX_HTML)
             return
 
+        if parsed.path == "/api/jobs":
+            with jobs_lock:
+                data = {"jobs": [snapshot_job(job) for job in jobs.values()]}
+            self.send_json(data)
+            return
+
         if parsed.path.startswith("/api/jobs/"):
             batch_id = parsed.path.removeprefix("/api/jobs/").strip("/")
             with jobs_lock:
@@ -551,10 +557,14 @@ INDEX_HTML = r"""<!doctype html>
       box-sizing: border-box;
     }
 
+    [hidden] {
+      display: none !important;
+    }
+
     body {
       margin: 0;
       min-height: 100vh;
-      background: var(--paper);
+      background: linear-gradient(180deg, #f7f9fc 0, var(--paper) 280px);
       color: var(--ink);
       font-family: Arial, Helvetica, sans-serif;
     }
@@ -576,8 +586,8 @@ INDEX_HTML = r"""<!doctype html>
     h1 {
       margin: 0 0 8px;
       font-size: clamp(30px, 4vw, 52px);
-      line-height: 1;
-      letter-spacing: 0;
+      line-height: 0.98;
+      letter-spacing: -1.5px;
     }
 
     p {
@@ -590,21 +600,21 @@ INDEX_HTML = r"""<!doctype html>
       display: grid;
       grid-template-columns: minmax(0, 420px) minmax(0, 1fr);
       gap: 18px;
-      align-items: start;
+      align-items: stretch;
     }
 
     .panel,
     .queue {
       background: var(--surface);
       border: 1px solid var(--line);
-      border-radius: 8px;
-      box-shadow: 0 8px 24px rgba(30, 38, 56, 0.06);
+      border-radius: 10px;
+      box-shadow: 0 10px 28px rgba(30, 38, 56, 0.07);
     }
 
     .panel {
       padding: 18px;
-      position: sticky;
-      top: 18px;
+      display: flex;
+      flex-direction: column;
     }
 
     label {
@@ -615,7 +625,8 @@ INDEX_HTML = r"""<!doctype html>
 
     textarea {
       width: 100%;
-      min-height: 290px;
+      height: clamp(170px, 31vh, 290px);
+      min-height: 140px;
       resize: vertical;
       border: 1px solid var(--line);
       border-radius: 6px;
@@ -630,6 +641,41 @@ INDEX_HTML = r"""<!doctype html>
     a.button:focus-visible {
       outline: 3px solid rgba(14, 124, 102, 0.22);
       outline-offset: 2px;
+    }
+
+    .input-guide {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px 18px;
+      margin: 10px 0 0;
+      padding: 0;
+      list-style: none;
+      counter-reset: input-step;
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .input-guide li {
+      display: flex;
+      align-items: center;
+      gap: 7px;
+      line-height: 1.4;
+      counter-increment: input-step;
+    }
+
+    .input-guide li::before {
+      content: counter(input-step);
+      width: 22px;
+      height: 22px;
+      border-radius: 50%;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      flex: 0 0 22px;
+      background: #e8f3f0;
+      color: var(--accent-dark);
+      font-size: 12px;
+      font-weight: 700;
     }
 
     .actions {
@@ -656,11 +702,13 @@ INDEX_HTML = r"""<!doctype html>
       text-decoration: none;
       cursor: pointer;
       white-space: nowrap;
+      transition: background-color 160ms ease, box-shadow 160ms ease;
     }
 
     button:hover,
     .button:hover {
       background: var(--accent-dark);
+      box-shadow: 0 5px 14px rgba(14, 124, 102, 0.18);
     }
 
     .secondary-button {
@@ -670,6 +718,7 @@ INDEX_HTML = r"""<!doctype html>
 
     .secondary-button:hover {
       background: #dfe5ee;
+      box-shadow: 0 5px 14px rgba(51, 65, 85, 0.12);
     }
 
     button:disabled {
@@ -683,7 +732,7 @@ INDEX_HTML = r"""<!doctype html>
     }
 
     .notice {
-      margin-top: 16px;
+      margin-top: auto;
       padding: 12px;
       border: 1px solid #ead5a5;
       border-radius: 6px;
@@ -694,14 +743,17 @@ INDEX_HTML = r"""<!doctype html>
     }
 
     .queue {
-      min-height: 480px;
+      min-height: clamp(360px, calc(100vh - 230px), 480px);
       overflow: hidden;
+      display: flex;
+      flex-direction: column;
     }
 
     .queue-head {
       display: flex;
       align-items: center;
       justify-content: space-between;
+      flex-wrap: wrap;
       gap: 12px;
       padding: 16px 18px;
       border-bottom: 1px solid var(--line);
@@ -729,13 +781,35 @@ INDEX_HTML = r"""<!doctype html>
     }
 
     .empty {
-      padding: 80px 24px;
+      min-height: 100%;
+      padding: 48px 24px;
+      display: grid;
+      place-items: center;
       text-align: center;
     }
 
     .items {
-      display: grid;
+      display: flex;
+      flex-direction: column;
       gap: 0;
+      flex: 1;
+    }
+
+    .batch-group + .batch-group {
+      border-top: 6px solid #f1f3f7;
+    }
+
+    .batch-label {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 9px 18px;
+      border-bottom: 1px solid var(--line);
+      background: #f7f8fa;
+      color: #445063;
+      font-size: 12px;
+      font-weight: 700;
     }
 
     .item {
@@ -819,11 +893,37 @@ INDEX_HTML = r"""<!doctype html>
       background: #243043;
     }
 
+    .downloads .button:hover,
+    .top-download:hover {
+      background: #172033;
+      box-shadow: 0 5px 14px rgba(36, 48, 67, 0.18);
+    }
+
     .error-text {
       color: var(--danger);
       font-weight: 700;
       margin-top: 10px;
+      margin-bottom: 16px;
       min-height: 20px;
+    }
+
+    @media (min-width: 861px) and (max-height: 700px) {
+      main {
+        padding-top: 18px;
+        padding-bottom: 28px;
+      }
+
+      header {
+        margin-bottom: 16px;
+      }
+
+      h1 {
+        font-size: clamp(30px, 4vw, 44px);
+      }
+
+      textarea {
+        height: clamp(140px, 26vh, 190px);
+      }
     }
 
     @media (max-width: 860px) {
@@ -840,10 +940,6 @@ INDEX_HTML = r"""<!doctype html>
 
       header {
         display: block;
-      }
-
-      .panel {
-        position: static;
       }
 
       .queue-head,
@@ -879,7 +975,11 @@ INDEX_HTML = r"""<!doctype html>
     <section class="shell" aria-label="Converter">
       <form class="panel" id="batchForm">
         <label for="urls">YouTube links</label>
-        <textarea id="urls" name="urls" spellcheck="false" placeholder="https://www.youtube.com/watch?v=...&#10;https://youtu.be/..."></textarea>
+        <textarea id="urls" name="urls" spellcheck="false" aria-describedby="urlHint" placeholder="https://www.youtube.com/watch?v=...&#10;https://youtu.be/..."></textarea>
+        <ol class="input-guide" id="urlHint">
+          <li>Paste a YouTube link</li>
+          <li>Press Enter for another link</li>
+        </ol>
         <div class="actions">
           <button id="convertButton" type="submit">Convert Batch</button>
           <button class="secondary-button" id="clearLinksButton" type="button">Clear Links</button>
@@ -918,9 +1018,8 @@ INDEX_HTML = r"""<!doctype html>
     const itemsNode = document.querySelector("#items");
     const statsNode = document.querySelector("#stats");
     const downloadAllButton = document.querySelector("#downloadAllButton");
-    let currentBatchId = "";
+    const batches = new Map();
     let pollTimer = 0;
-    let latestBatch = null;
 
     textarea.addEventListener("input", updateLinkCount);
     clearLinksButton.addEventListener("click", () => {
@@ -930,6 +1029,7 @@ INDEX_HTML = r"""<!doctype html>
       textarea.focus();
     });
     downloadAllButton.addEventListener("click", downloadAll);
+    loadHistory();
 
     form.addEventListener("submit", async (event) => {
       event.preventDefault();
@@ -946,10 +1046,10 @@ INDEX_HTML = r"""<!doctype html>
         const data = await response.json();
         if (!response.ok) throw new Error(data.error || "Unable to start batch");
 
-        currentBatchId = data.id;
+        batches.set(data.id, data);
         textarea.value = "";
         updateLinkCount();
-        render(data);
+        renderHistory();
         startPolling();
       } catch (error) {
         errorText.textContent = error.message;
@@ -961,8 +1061,8 @@ INDEX_HTML = r"""<!doctype html>
 
     function startPolling() {
       if (pollTimer) clearInterval(pollTimer);
-      pollTimer = setInterval(refresh, 1500);
-      refresh();
+      pollTimer = setInterval(refreshHistory, 1500);
+      refreshHistory();
     }
 
     function updateLinkCount() {
@@ -973,33 +1073,47 @@ INDEX_HTML = r"""<!doctype html>
       linkCount.textContent = `${count} ${count === 1 ? "link" : "links"} inserted`;
     }
 
-    async function refresh() {
-      if (!currentBatchId) return;
-      const response = await fetch(`/api/jobs/${currentBatchId}`);
-      const data = await response.json();
-      if (!response.ok) {
-        errorText.textContent = data.error || "Unable to refresh batch";
-        clearInterval(pollTimer);
-        return;
+    async function loadHistory() {
+      try {
+        const active = await refreshHistory();
+        if (active > 0) startPolling();
+      } catch (error) {
+        errorText.textContent = error.message;
       }
-
-      render(data);
-      const active = data.counts.queued + data.counts.running;
-      if (active === 0) clearInterval(pollTimer);
     }
 
-    async function retryItem(itemId) {
-      if (!currentBatchId) return;
+    async function refreshHistory() {
+      const response = await fetch("/api/jobs");
+      const data = await response.json();
+      if (!response.ok) {
+        errorText.textContent = data.error || "Unable to refresh queue";
+        clearInterval(pollTimer);
+        return 0;
+      }
+
+      batches.clear();
+      data.jobs.forEach((batch) => batches.set(batch.id, batch));
+      renderHistory();
+      const active = data.jobs.reduce(
+        (total, batch) => total + batch.counts.queued + batch.counts.running,
+        0
+      );
+      if (active === 0) clearInterval(pollTimer);
+      return active;
+    }
+
+    async function retryItem(batchId, itemId) {
       errorText.textContent = "";
 
       try {
-        const response = await fetch(`/api/jobs/${currentBatchId}/items/${itemId}/retry`, {
+        const response = await fetch(`/api/jobs/${batchId}/items/${itemId}/retry`, {
           method: "POST"
         });
         const data = await response.json();
         if (!response.ok) throw new Error(data.error || "Unable to retry item");
 
-        render(data);
+        batches.set(batchId, data);
+        renderHistory();
         startPolling();
       } catch (error) {
         errorText.textContent = error.message;
@@ -1007,8 +1121,9 @@ INDEX_HTML = r"""<!doctype html>
     }
 
     function downloadAll() {
-      if (!latestBatch) return;
-      const urls = latestBatch.items.flatMap((item) => item.downloadUrls || []);
+      const urls = Array.from(batches.values()).flatMap((batch) => (
+        batch.items.flatMap((item) => item.downloadUrls || [])
+      ));
       if (!urls.length) return;
 
       urls.forEach((url, index) => {
@@ -1023,20 +1138,36 @@ INDEX_HTML = r"""<!doctype html>
       });
     }
 
-    function render(data) {
-      latestBatch = data;
-      const counts = data.counts;
+    function renderHistory() {
+      const history = Array.from(batches.values());
+      const counts = history.reduce((total, batch) => ({
+        total: total.total + batch.counts.total,
+        queued: total.queued + batch.counts.queued,
+        running: total.running + batch.counts.running,
+        done: total.done + batch.counts.done,
+        error: total.error + batch.counts.error
+      }), { total: 0, queued: 0, running: 0, done: 0, error: 0 });
+
       statsNode.innerHTML = `
         <span class="stat">${counts.total} total</span>
+        <span class="stat">${counts.queued} waiting</span>
         <span class="stat">${counts.running} running</span>
         <span class="stat">${counts.done} ready</span>
         <span class="stat">${counts.error} failed</span>
       `;
 
-      const readyDownloads = data.items.flatMap((item) => item.downloadUrls || []);
+      const readyDownloads = history.flatMap((batch) => (
+        batch.items.flatMap((item) => item.downloadUrls || [])
+      ));
       downloadAllButton.hidden = readyDownloads.length === 0;
 
-      itemsNode.innerHTML = data.items.map((item) => {
+      if (!history.length) {
+        itemsNode.innerHTML = `<div class="empty"><p>No batch is running yet.</p></div>`;
+        return;
+      }
+
+      itemsNode.innerHTML = history.map((batch, batchIndex) => {
+        const items = batch.items.map((item) => {
         const progressValue = Number((item.progress || "0").replace("%", "")) || 0;
         const fileName = item.files && item.files.length ? item.files.join(", ") : "";
         const displayName = fileName || item.title || item.url;
@@ -1044,7 +1175,7 @@ INDEX_HTML = r"""<!doctype html>
           `<a class="button" href="${url}">Download MP3 ${index + 1}</a>`
         )).join("");
         const retry = item.status === "error"
-          ? `<button class="button retry-button" type="button" onclick="retryItem('${item.id}')">Retry</button>`
+          ? `<button class="button retry-button" type="button" onclick="retryItem('${batch.id}', '${item.id}')">Retry</button>`
           : "";
 
         return `
@@ -1059,6 +1190,17 @@ INDEX_HTML = r"""<!doctype html>
             </div>
             <progress max="100" value="${progressValue}"></progress>
           </article>
+        `;
+        }).join("");
+
+        return `
+          <section class="batch-group">
+            <div class="batch-label">
+              <span>Batch ${batchIndex + 1}</span>
+              <span>${batch.items.length} ${batch.items.length === 1 ? "item" : "items"}</span>
+            </div>
+            ${items}
+          </section>
         `;
       }).join("");
     }

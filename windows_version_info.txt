@@ -1,7 +1,7 @@
 VSVersionInfo(
   ffi=FixedFileInfo(
-    filevers=(1, 0, 0, 0),
-    prodvers=(1, 0, 0, 0),
+    filevers=(1, 1, 0, 0),
+    prodvers=(1, 1, 0, 0),
     mask=0x3f,
     flags=0x0,
     OS=0x40004,
@@ -15,11 +15,11 @@ VSVersionInfo(
         '040904B0',
         [
           StringStruct('FileDescription', 'YouTube to MP3 Batch Converter'),
-          StringStruct('FileVersion', '1.0.0'),
+          StringStruct('FileVersion', '1.1.0'),
           StringStruct('InternalName', 'YouTubeMP3Converter'),
           StringStruct('OriginalFilename', 'YouTubeMP3Converter.exe'),
           StringStruct('ProductName', 'YouTube to MP3 Batch Converter'),
-          StringStruct('ProductVersion', '1.0.0')
+          StringStruct('ProductVersion', '1.1.0')
         ]
       )
     ]),

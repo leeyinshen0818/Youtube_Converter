@@ -132,4 +132,5 @@ Those steps come from `yt-dlp` and YouTube, not from the app UI. Node.js support
 - Batches are limited to 50 links.
 - The app downloads only the individual video URL you paste, not an entire playlist.
 - Two conversions run at the same time by default. You can change `MAX_WORKERS` in `app.py`.
+- Queue history remains available across consecutive batches while the app is running. It resets when the app restarts.
 - Converted files are saved in the local `downloads/` folder.
