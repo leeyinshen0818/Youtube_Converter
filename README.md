@@ -36,7 +36,7 @@ ffmpeg -version
 If Windows still cannot find `ffmpeg`, add this folder to your user `Path`:
 
 ```text
-C:\Users\Nitro\AppData\Local\Microsoft\WinGet\Links
+%LOCALAPPDATA%\Microsoft\WinGet\Links
 ```
 
 Then close and reopen your terminal and restart `python app.py`.

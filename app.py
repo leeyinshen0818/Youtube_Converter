@@ -35,6 +35,7 @@ MAX_BATCH_SIZE = 50
 MAX_WORKERS = 2
 SERVER_HOST = "127.0.0.1"
 SERVER_PORT = 8080
+APP_VERSION = "1.0.0"
 
 
 @dataclass
@@ -416,7 +417,7 @@ def build_zip(batch_id: str) -> Path:
 
 
 class AppHandler(BaseHTTPRequestHandler):
-    server_version = "YouTubeBatchConverter/1.0"
+    server_version = f"YouTubeBatchConverter/{APP_VERSION}"
 
     def do_GET(self) -> None:
         parsed = urlparse(self.path)

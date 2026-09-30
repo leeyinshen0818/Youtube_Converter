@@ -5,6 +5,7 @@ $python = Join-Path $projectDir ".venv\Scripts\python.exe"
 $assetDir = Join-Path $projectDir ".build-assets\bin"
 $iconPng = Join-Path $projectDir "icon\icon1.png"
 $iconIco = Join-Path $projectDir ".build-assets\icon.ico"
+$versionFile = Join-Path $projectDir "windows_version_info.txt"
 
 if (-not (Test-Path $python)) {
     throw "Project virtual environment not found. Create .venv before building."
@@ -35,6 +36,7 @@ if ($LASTEXITCODE -ne 0) { throw "Unable to create the Windows icon." }
     --windowed `
     --name "YouTubeMP3Converter" `
     --icon $iconIco `
+    --version-file $versionFile `
     --add-data "$iconPng;icon" `
     --add-binary "$(Join-Path $assetDir 'ffmpeg.exe');bin" `
     --add-binary "$(Join-Path $assetDir 'ffprobe.exe');bin" `
