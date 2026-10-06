@@ -47,6 +47,8 @@ class ConversionItem:
     message: str = "Waiting"
     progress: str = ""
     files: list[str] = field(default_factory=list)
+    downloaded_files: list[str] = field(default_factory=list)
+    downloaded_at: float | None = None
     started_at: float | None = None
     finished_at: float | None = None
 
@@ -60,7 +62,12 @@ class BatchJob:
 
 jobs: dict[str, BatchJob] = {}
 jobs_lock = threading.Lock()
+cancel_events: dict[tuple[str, str], threading.Event] = {}
 executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
+
+
+class ConversionStopped(Exception):
+    pass
 
 
 def ffmpeg_location() -> str | None:
@@ -120,22 +127,38 @@ def parse_urls(payload: dict[str, Any]) -> list[str]:
 
 
 def snapshot_job(job: BatchJob) -> dict[str, Any]:
-    queued = running = done = error = 0
+    queued = running = stopping = stopped = done = error = 0
     items: list[dict[str, Any]] = []
     for item in job.items:
         if item.status == "queued":
             queued += 1
         elif item.status == "running":
             running += 1
+        elif item.status == "stopping":
+            stopping += 1
+        elif item.status == "stopped":
+            stopped += 1
         elif item.status == "done":
             done += 1
         elif item.status == "error":
             error += 1
 
         item_data = asdict(item)
+        item_data["downloadedFiles"] = item_data.pop("downloaded_files")
+        item_data["downloadedAt"] = item_data.pop("downloaded_at")
+        available_files = []
+        missing_files = []
+        for filename in item.files:
+            try:
+                safe_lookup_file(job.id, item.id, filename)
+                available_files.append(filename)
+            except FileNotFoundError:
+                missing_files.append(filename)
         item_data["downloadUrls"] = [
-            f"/api/download/{job.id}/{item.id}/{quote(filename)}" for filename in item.files
+            f"/api/download/{job.id}/{item.id}/{quote(filename)}"
+            for filename in available_files
         ]
+        item_data["missingFiles"] = missing_files
         items.append(item_data)
 
     return {
@@ -144,6 +167,8 @@ def snapshot_job(job: BatchJob) -> dict[str, Any]:
         "counts": {
             "queued": queued,
             "running": running,
+            "stopping": stopping,
+            "stopped": stopped,
             "done": done,
             "error": error,
             "total": len(job.items),
@@ -151,6 +176,57 @@ def snapshot_job(job: BatchJob) -> dict[str, Any]:
         "items": items,
         "zipUrl": f"/api/download/{job.id}.zip" if done else "",
     }
+
+
+def snapshot_jobs() -> dict[str, Any]:
+    with jobs_lock:
+        return {"jobs": [snapshot_job(job) for job in jobs.values()]}
+
+
+def clear_job_items(statuses: set[str]) -> dict[str, Any]:
+    removed = 0
+    preserved_active = 0
+    with jobs_lock:
+        empty_batch_ids: list[str] = []
+        for batch_id, job in jobs.items():
+            kept_items: list[ConversionItem] = []
+            for item in job.items:
+                if item.status in statuses:
+                    removed += 1
+                else:
+                    kept_items.append(item)
+                    if item.status in {"queued", "running", "stopping"}:
+                        preserved_active += 1
+            job.items = kept_items
+            if not job.items:
+                empty_batch_ids.append(batch_id)
+
+        for batch_id in empty_batch_ids:
+            del jobs[batch_id]
+        for key in list(cancel_events):
+            if key[0] not in jobs or all(item.id != key[1] for item in jobs[key[0]].items):
+                del cancel_events[key]
+
+        return {
+            "jobs": [snapshot_job(job) for job in jobs.values()],
+            "removed": removed,
+            "preservedActive": preserved_active,
+        }
+
+
+def mark_files_downloaded(file_keys: list[tuple[str, str, str]]) -> None:
+    downloaded_at = time.time()
+    with jobs_lock:
+        for batch_id, item_id, filename in file_keys:
+            job = jobs.get(batch_id)
+            if job is None:
+                continue
+            item = next((entry for entry in job.items if entry.id == item_id), None)
+            if item is None or filename not in item.files:
+                continue
+            if filename not in item.downloaded_files:
+                item.downloaded_files.append(filename)
+            item.downloaded_at = downloaded_at
 
 
 def set_item_state(batch_id: str, item_id: str, **changes: Any) -> None:
@@ -174,44 +250,59 @@ def cookies_file() -> Path | None:
 
 
 def run_conversion(batch_id: str, item_id: str, url: str) -> None:
+    with jobs_lock:
+        job = jobs.get(batch_id)
+        item = next((entry for entry in job.items if entry.id == item_id), None) if job else None
+        if item is None or item.status != "queued":
+            return
+        cancel_event = cancel_events[(batch_id, item_id)]
+        item.status = "running"
+        item.message = "Starting conversion"
+        item.started_at = time.time()
+
+    def check_cancelled() -> None:
+        if cancel_event.is_set():
+            raise ConversionStopped()
+
     item_dir = DOWNLOAD_DIR / batch_id / item_id
     item_dir.mkdir(parents=True, exist_ok=True)
 
     try:
         import yt_dlp
     except ImportError:
-        set_item_state(
-            batch_id,
-            item_id,
-            status="error",
-            message="yt-dlp is not installed. Run: python -m pip install -r requirements.txt",
-            finished_at=time.time(),
-        )
+        with jobs_lock:
+            item = next(entry for entry in jobs[batch_id].items if entry.id == item_id)
+            item.status = "stopped" if cancel_event.is_set() else "error"
+            item.message = (
+                "Stopped" if cancel_event.is_set()
+                else "yt-dlp is not installed. Run: python -m pip install -r requirements.txt"
+            )
+            item.finished_at = time.time()
+        return
+
+    if cancel_event.is_set():
+        set_item_state(batch_id, item_id, status="stopped", message="Stopped", finished_at=time.time())
         return
 
     ffmpeg_path = ffmpeg_location()
+    if cancel_event.is_set():
+        set_item_state(batch_id, item_id, status="stopped", message="Stopped", finished_at=time.time())
+        return
     if ffmpeg_path is None:
-        set_item_state(
-            batch_id,
-            item_id,
-            status="error",
-            message="ffmpeg is not installed or is not on PATH. Install ffmpeg, then try again.",
-            finished_at=time.time(),
-        )
+        with jobs_lock:
+            item = next(entry for entry in jobs[batch_id].items if entry.id == item_id)
+            item.status = "stopped" if cancel_event.is_set() else "error"
+            item.message = (
+                "Stopped" if cancel_event.is_set()
+                else "ffmpeg is not installed or is not on PATH. Install ffmpeg, then try again."
+            )
+            item.finished_at = time.time()
         return
 
     output_template = str(item_dir / "%(title).180B [%(id)s].%(ext)s")
     bundled_node = BUNDLE_DIR / "bin" / "node.exe"
     node_path = str(bundled_node) if bundled_node.is_file() else shutil.which("node")
     cookie_path = cookies_file()
-
-    set_item_state(
-        batch_id,
-        item_id,
-        status="running",
-        message="Starting conversion",
-        started_at=time.time(),
-    )
 
     last_line = ""
     cookie_required = False
@@ -221,6 +312,7 @@ def run_conversion(batch_id: str, item_id: str, url: str) -> None:
 
     def record_message(message: Any) -> None:
         nonlocal last_line, cookie_required
+        check_cancelled()
         clean = clean_message(message)
         if not clean:
             return
@@ -245,6 +337,7 @@ def run_conversion(batch_id: str, item_id: str, url: str) -> None:
             record_message(message)
 
     def progress_hook(data: dict[str, Any]) -> None:
+        check_cancelled()
         info = data.get("info_dict") or {}
         title = str(info.get("title") or "")
         status = data.get("status")
@@ -269,6 +362,7 @@ def run_conversion(batch_id: str, item_id: str, url: str) -> None:
             )
 
     def postprocessor_hook(data: dict[str, Any]) -> None:
+        check_cancelled()
         if data.get("status") == "started":
             set_item_state(batch_id, item_id, message="Converting to MP3")
 
@@ -295,22 +389,28 @@ def run_conversion(batch_id: str, item_id: str, url: str) -> None:
         options["cookiefile"] = str(cookie_path)
 
     try:
+        check_cancelled()
         with yt_dlp.YoutubeDL(options) as downloader:
             downloader.extract_info(url, download=True)
+        check_cancelled()
         files = list_mp3_files(item_dir)
         if files:
-            set_item_state(
-                batch_id,
-                item_id,
-                status="done",
-                message="Ready to download",
-                progress="100%",
-                files=files,
-                finished_at=time.time(),
-            )
+            with jobs_lock:
+                item = next(entry for entry in jobs[batch_id].items if entry.id == item_id)
+                item.status = "stopped" if cancel_event.is_set() else "done"
+                item.message = "Stopped" if cancel_event.is_set() else "Ready to download"
+                item.progress = "" if cancel_event.is_set() else "100%"
+                item.files = [] if cancel_event.is_set() else files
+                item.finished_at = time.time()
             return
         raise RuntimeError(last_line or "Conversion finished without creating an MP3 file")
     except Exception as exc:  # pragma: no cover - defensive background task guard
+        if cancel_event.is_set():
+            set_item_state(
+                batch_id, item_id, status="stopped", message="Stopped",
+                progress="", files=[], finished_at=time.time(),
+            )
+            return
         if cookie_required and cookie_path:
             reason = (
                 "YouTube rejected cookies.txt. Export fresh YouTube cookies, replace the "
@@ -341,6 +441,8 @@ def create_batch(payload: dict[str, Any]) -> dict[str, Any]:
 
     with jobs_lock:
         jobs[batch_id] = job
+        for item in items:
+            cancel_events[(batch_id, item.id)] = threading.Event()
 
     for item in items:
         executor.submit(run_conversion, batch_id, item.id, item.url)
@@ -357,7 +459,7 @@ def retry_item(batch_id: str, item_id: str) -> dict[str, Any]:
         item = next((entry for entry in job.items if entry.id == item_id), None)
         if item is None:
             raise FileNotFoundError("Queue item not found")
-        if item.status in {"queued", "running"}:
+        if item.status in {"queued", "running", "stopping"}:
             raise ValueError("This item is already queued or running")
 
         item.status = "queued"
@@ -365,14 +467,39 @@ def retry_item(batch_id: str, item_id: str) -> dict[str, Any]:
         item.message = "Waiting"
         item.progress = ""
         item.files = []
+        item.downloaded_files = []
+        item.downloaded_at = None
         item.started_at = None
         item.finished_at = None
+        cancel_events[(batch_id, item_id)] = threading.Event()
         url = item.url
 
     executor.submit(run_conversion, batch_id, item_id, url)
 
     with jobs_lock:
         job = jobs[batch_id]
+        return snapshot_job(job)
+
+
+def stop_item(batch_id: str, item_id: str) -> dict[str, Any]:
+    with jobs_lock:
+        job = jobs.get(batch_id)
+        if job is None:
+            raise FileNotFoundError("Batch not found")
+        item = next((entry for entry in job.items if entry.id == item_id), None)
+        if item is None:
+            raise FileNotFoundError("Queue item not found")
+        if item.status not in {"queued", "running"}:
+            raise ValueError("Only waiting or running items can be stopped")
+
+        cancel_events[(batch_id, item_id)].set()
+        if item.status == "queued":
+            item.status = "stopped"
+            item.message = "Stopped before conversion"
+            item.finished_at = time.time()
+        else:
+            item.status = "stopping"
+            item.message = "Stopping conversion"
         return snapshot_job(job)
 
 
@@ -387,33 +514,47 @@ def safe_lookup_file(batch_id: str, item_id: str, filename: str) -> Path:
     return target
 
 
-def build_zip(batch_id: str) -> Path:
-    with jobs_lock:
-        job = jobs.get(batch_id)
-        if job is None:
-            raise FileNotFoundError("Batch not found")
-        item_file_pairs = [
-            (item.id, filename)
-            for item in job.items
-            if item.status == "done"
-            for filename in item.files
-        ]
-
-    if not item_file_pairs:
-        raise FileNotFoundError("No converted MP3 files are ready")
-
-    batch_dir = DOWNLOAD_DIR / batch_id
-    zip_path = batch_dir / "youtube-mp3-batch.zip"
-    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-        used_names: set[str] = set()
-        for item_id, filename in item_file_pairs:
-            source = safe_lookup_file(batch_id, item_id, filename)
+def write_zip(
+    zip_path: Path, file_keys: list[tuple[str, str, str]]
+) -> tuple[Path, list[tuple[str, str, str]]]:
+    zip_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_zip = zip_path.with_name(f".{zip_path.name}.{uuid.uuid4().hex}.tmp")
+    included: list[tuple[str, str, str]] = []
+    used_names: set[str] = set()
+    with zipfile.ZipFile(temporary_zip, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for batch_id, item_id, filename in file_keys:
+            try:
+                source = safe_lookup_file(batch_id, item_id, filename)
+            except FileNotFoundError:
+                continue
             archive_name = source.name
             if archive_name in used_names:
                 archive_name = f"{item_id[:8]}-{archive_name}"
             used_names.add(archive_name)
             archive.write(source, archive_name)
-    return zip_path
+            included.append((batch_id, item_id, filename))
+
+    if not included:
+        temporary_zip.unlink(missing_ok=True)
+        raise FileNotFoundError("No converted MP3 files are available")
+
+    os.replace(temporary_zip, zip_path)
+    return zip_path, included
+
+
+def build_zip(batch_id: str) -> tuple[Path, list[tuple[str, str, str]]]:
+    with jobs_lock:
+        job = jobs.get(batch_id)
+        if job is None:
+            raise FileNotFoundError("Batch not found")
+        file_keys = [
+            (batch_id, item.id, filename)
+            for item in job.items
+            if item.status == "done"
+            for filename in item.files
+        ]
+
+    return write_zip(DOWNLOAD_DIR / batch_id / "youtube-mp3-batch.zip", file_keys)
 
 
 class AppHandler(BaseHTTPRequestHandler):
@@ -426,9 +567,7 @@ class AppHandler(BaseHTTPRequestHandler):
             return
 
         if parsed.path == "/api/jobs":
-            with jobs_lock:
-                data = {"jobs": [snapshot_job(job) for job in jobs.values()]}
-            self.send_json(data)
+            self.send_json(snapshot_jobs())
             return
 
         if parsed.path.startswith("/api/jobs/"):
@@ -445,7 +584,9 @@ class AppHandler(BaseHTTPRequestHandler):
         if parsed.path.startswith("/api/download/") and parsed.path.endswith(".zip"):
             batch_id = Path(parsed.path.removeprefix("/api/download/")).stem
             try:
-                self.send_file(build_zip(batch_id), "application/zip")
+                target, file_keys = build_zip(batch_id)
+                if self.send_file(target, "application/zip"):
+                    mark_files_downloaded(file_keys)
             except FileNotFoundError as exc:
                 self.send_json({"error": str(exc)}, HTTPStatus.NOT_FOUND)
             return
@@ -457,7 +598,8 @@ class AppHandler(BaseHTTPRequestHandler):
                 return
             try:
                 target = safe_lookup_file(parts[0], parts[1], parts[2])
-                self.send_file(target, "audio/mpeg")
+                if self.send_file(target, "audio/mpeg"):
+                    mark_files_downloaded([(parts[0], parts[1], target.name)])
             except FileNotFoundError as exc:
                 self.send_json({"error": str(exc)}, HTTPStatus.NOT_FOUND)
             return
@@ -466,6 +608,24 @@ class AppHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
+        if parsed.path == "/api/jobs/clear-history":
+            self.send_json(clear_job_items({"done", "error", "stopped"}))
+            return
+
+        if parsed.path == "/api/jobs/clear-completed":
+            self.send_json(clear_job_items({"done"}))
+            return
+
+        stop_match = re.fullmatch(r"/api/jobs/([^/]+)/items/([^/]+)/stop", parsed.path)
+        if stop_match:
+            try:
+                self.send_json(stop_item(stop_match.group(1), stop_match.group(2)))
+            except ValueError as exc:
+                self.send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+            except FileNotFoundError as exc:
+                self.send_json({"error": str(exc)}, HTTPStatus.NOT_FOUND)
+            return
+
         retry_match = re.fullmatch(r"/api/jobs/([^/]+)/items/([^/]+)/retry", parsed.path)
         if retry_match:
             try:
@@ -512,9 +672,8 @@ class AppHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(payload)
 
-    def send_file(self, path: Path, content_type: str) -> None:
+    def send_file(self, path: Path, content_type: str) -> bool:
         filename = path.name
-        data = path.read_bytes()
         ascii_filename = filename.encode("ascii", "ignore").decode("ascii").strip()
         if not ascii_filename:
             ascii_filename = f"download{path.suffix}"
@@ -522,13 +681,19 @@ class AppHandler(BaseHTTPRequestHandler):
         utf8_filename = quote(filename)
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Content-Length", str(path.stat().st_size))
         self.send_header(
             "Content-Disposition",
             f'attachment; filename="{ascii_filename}"; filename*=UTF-8\'\'{utf8_filename}',
         )
         self.end_headers()
-        self.wfile.write(data)
+        try:
+            with path.open("rb") as source:
+                shutil.copyfileobj(source, self.wfile, length=1024 * 1024)
+            self.wfile.flush()
+            return True
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            return False
 
 
 INDEX_HTML = r"""<!doctype html>
@@ -600,7 +765,7 @@ INDEX_HTML = r"""<!doctype html>
       display: grid;
       grid-template-columns: minmax(0, 420px) minmax(0, 1fr);
       gap: 18px;
-      align-items: stretch;
+      align-items: start;
     }
 
     .panel,
@@ -623,59 +788,50 @@ INDEX_HTML = r"""<!doctype html>
       margin-bottom: 10px;
     }
 
-    textarea {
+    .url-inputs {
       width: 100%;
-      height: clamp(170px, 31vh, 290px);
-      min-height: 140px;
-      resize: vertical;
+      height: 180px;
+      overflow-y: auto;
       border: 1px solid var(--line);
       border-radius: 6px;
-      padding: 12px;
-      font: 14px/1.45 Consolas, "Courier New", monospace;
-      color: var(--ink);
       background: #fff;
     }
 
-    textarea:focus,
+    .url-input {
+      display: block;
+      width: 100%;
+      min-width: 0;
+      height: 44px;
+      border: 0;
+      border-bottom: 1px solid #edf0f5;
+      padding: 0 12px;
+      background: transparent;
+      color: var(--ink);
+      font: 14px/1 Consolas, "Courier New", monospace;
+      white-space: nowrap;
+    }
+
+    .url-input:last-child {
+      border-bottom: 0;
+    }
+
+    .url-input:focus {
+      outline: 0;
+      background: #f9fbfb;
+    }
+
+    .url-inputs:focus-within,
     button:focus-visible,
     a.button:focus-visible {
       outline: 3px solid rgba(14, 124, 102, 0.22);
       outline-offset: 2px;
     }
 
-    .input-guide {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 8px 18px;
+    .input-hint {
       margin: 10px 0 0;
-      padding: 0;
-      list-style: none;
-      counter-reset: input-step;
       color: var(--muted);
       font-size: 13px;
-    }
-
-    .input-guide li {
-      display: flex;
-      align-items: center;
-      gap: 7px;
       line-height: 1.4;
-      counter-increment: input-step;
-    }
-
-    .input-guide li::before {
-      content: counter(input-step);
-      width: 22px;
-      height: 22px;
-      border-radius: 50%;
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
-      flex: 0 0 22px;
-      background: #e8f3f0;
-      color: var(--accent-dark);
-      font-size: 12px;
-      font-weight: 700;
     }
 
     .actions {
@@ -750,13 +906,45 @@ INDEX_HTML = r"""<!doctype html>
     }
 
     .queue-head {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      align-items: center;
+      gap: 10px;
+      padding: 12px 16px;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .queue-summary {
       display: flex;
       align-items: center;
-      justify-content: space-between;
       flex-wrap: wrap;
-      gap: 12px;
-      padding: 16px 18px;
-      border-bottom: 1px solid var(--line);
+      gap: 8px 12px;
+    }
+
+    .queue-tools {
+      display: flex;
+      align-items: center;
+      justify-content: flex-end;
+      flex-wrap: wrap;
+      gap: 6px;
+    }
+
+    .queue-action {
+      min-height: 32px;
+      padding: 0 10px;
+      border: 1px solid var(--line);
+      background: #f7f8fa;
+      color: #334155;
+      font-size: 12px;
+    }
+
+    .queue-action:hover {
+      background: #eef1f6;
+      box-shadow: 0 4px 12px rgba(51, 65, 85, 0.1);
+    }
+
+    .danger-button {
+      color: var(--danger);
     }
 
     h2 {
@@ -768,7 +956,7 @@ INDEX_HTML = r"""<!doctype html>
     .stats {
       display: flex;
       flex-wrap: wrap;
-      gap: 8px;
+      gap: 6px;
       color: var(--muted);
       font-size: 13px;
     }
@@ -776,7 +964,7 @@ INDEX_HTML = r"""<!doctype html>
     .stat {
       border: 1px solid var(--line);
       border-radius: 999px;
-      padding: 5px 9px;
+      padding: 4px 8px;
       background: #fff;
     }
 
@@ -796,7 +984,7 @@ INDEX_HTML = r"""<!doctype html>
     }
 
     .batch-group + .batch-group {
-      border-top: 6px solid #f1f3f7;
+      border-top: 4px solid #f1f3f7;
     }
 
     .batch-label {
@@ -804,7 +992,7 @@ INDEX_HTML = r"""<!doctype html>
       align-items: center;
       justify-content: space-between;
       gap: 12px;
-      padding: 9px 18px;
+      padding: 7px 16px;
       border-bottom: 1px solid var(--line);
       background: #f7f8fa;
       color: #445063;
@@ -813,10 +1001,32 @@ INDEX_HTML = r"""<!doctype html>
     }
 
     .item {
-      padding: 16px 18px;
+      padding: 12px 16px;
       border-bottom: 1px solid var(--line);
+      border-left: 3px solid transparent;
       display: grid;
-      gap: 10px;
+      gap: 8px;
+      content-visibility: auto;
+      contain-intrinsic-size: 104px;
+    }
+
+    .item.running {
+      border-left-color: var(--blue);
+      background: #fbfdff;
+    }
+
+    .item.stopping,
+    .item.stopped {
+      border-left-color: #718096;
+    }
+
+    .item.done {
+      border-left-color: var(--ok);
+    }
+
+    .item.error {
+      border-left-color: var(--danger);
+      background: #fffdfd;
     }
 
     .item:last-child {
@@ -825,17 +1035,17 @@ INDEX_HTML = r"""<!doctype html>
 
     .item-main {
       display: grid;
-      grid-template-columns: 88px minmax(0, 1fr) auto;
-      gap: 12px;
-      align-items: start;
+      grid-template-columns: 92px minmax(0, 1fr) auto;
+      gap: 10px;
+      align-items: center;
     }
 
     .badge {
-      min-height: 28px;
+      min-height: 26px;
       border-radius: 999px;
-      padding: 6px 10px;
+      padding: 5px 8px;
       text-align: center;
-      font-size: 12px;
+      font-size: 11px;
       font-weight: 800;
       text-transform: uppercase;
       letter-spacing: 0;
@@ -846,6 +1056,12 @@ INDEX_HTML = r"""<!doctype html>
     .badge.running {
       background: #eaf2ff;
       color: var(--blue);
+    }
+
+    .badge.stopping,
+    .badge.stopped {
+      background: #eef1f6;
+      color: #445063;
     }
 
     .badge.done {
@@ -861,18 +1077,34 @@ INDEX_HTML = r"""<!doctype html>
     .url {
       overflow-wrap: anywhere;
       font-size: 14px;
+      line-height: 1.3;
     }
 
     .message {
       color: var(--muted);
       font-size: 13px;
+      line-height: 1.3;
       overflow-wrap: anywhere;
       margin-top: 4px;
     }
 
+    .download-state {
+      display: inline-flex;
+      margin-top: 6px;
+      color: var(--ok);
+      font-size: 12px;
+      font-weight: 700;
+    }
+
+    .missing-file {
+      color: var(--danger);
+      font-size: 12px;
+      font-weight: 700;
+    }
+
     progress {
       width: 100%;
-      height: 10px;
+      height: 7px;
       accent-color: var(--accent);
     }
 
@@ -883,14 +1115,17 @@ INDEX_HTML = r"""<!doctype html>
     }
 
     .downloads .button {
-      min-height: 34px;
-      padding: 0 12px;
-      font-size: 13px;
+      min-height: 32px;
+      padding: 0 10px;
+      font-size: 12px;
       background: #243043;
     }
 
     .top-download {
       background: #243043;
+      min-height: 36px;
+      padding: 0 13px;
+      font-size: 13px;
     }
 
     .downloads .button:hover,
@@ -921,8 +1156,8 @@ INDEX_HTML = r"""<!doctype html>
         font-size: clamp(30px, 4vw, 44px);
       }
 
-      textarea {
-        height: clamp(140px, 26vh, 190px);
+      .url-inputs {
+        height: 150px;
       }
     }
 
@@ -942,10 +1177,18 @@ INDEX_HTML = r"""<!doctype html>
         display: block;
       }
 
-      .queue-head,
+      .queue-head {
+        grid-template-columns: 1fr;
+        align-items: stretch;
+      }
+
       .actions {
         align-items: stretch;
         flex-direction: column;
+      }
+
+      .queue-tools {
+        justify-content: stretch;
       }
 
       button,
@@ -974,12 +1217,11 @@ INDEX_HTML = r"""<!doctype html>
 
     <section class="shell" aria-label="Converter">
       <form class="panel" id="batchForm">
-        <label for="urls">YouTube links</label>
-        <textarea id="urls" name="urls" spellcheck="false" aria-describedby="urlHint" placeholder="https://www.youtube.com/watch?v=...&#10;https://youtu.be/..."></textarea>
-        <ol class="input-guide" id="urlHint">
-          <li>Paste a YouTube link</li>
-          <li>Press Enter for another link</li>
-        </ol>
+        <label for="url-1">YouTube links</label>
+        <div class="url-inputs" id="urlInputs">
+          <input class="url-input" id="url-1" type="url" inputmode="url" autocomplete="off" spellcheck="false" aria-describedby="urlHint" placeholder="Paste a YouTube link">
+        </div>
+        <p class="input-hint" id="urlHint" aria-live="polite">Paste a YouTube link above.</p>
         <div class="actions">
           <button id="convertButton" type="submit">Convert Batch</button>
           <button class="secondary-button" id="clearLinksButton" type="button">Clear Links</button>
@@ -993,11 +1235,14 @@ INDEX_HTML = r"""<!doctype html>
 
       <section class="queue" aria-live="polite">
         <div class="queue-head">
-          <div>
+          <div class="queue-summary">
             <h2>Queue</h2>
             <div class="stats" id="stats"></div>
           </div>
-          <button class="button top-download" id="downloadAllButton" type="button" hidden>Download All</button>
+          <div class="queue-tools">
+            <button class="queue-action danger-button" id="clearHistoryButton" type="button" hidden>Clear List</button>
+            <button class="button top-download" id="downloadAllButton" type="button" hidden>Download All</button>
+          </div>
         </div>
         <div id="items" class="items">
           <div class="empty">
@@ -1010,25 +1255,65 @@ INDEX_HTML = r"""<!doctype html>
 
   <script>
     const form = document.querySelector("#batchForm");
-    const textarea = document.querySelector("#urls");
+    const urlInputs = document.querySelector("#urlInputs");
     const button = document.querySelector("#convertButton");
     const clearLinksButton = document.querySelector("#clearLinksButton");
     const linkCount = document.querySelector("#linkCount");
+    const urlHint = document.querySelector("#urlHint");
     const errorText = document.querySelector("#errorText");
     const itemsNode = document.querySelector("#items");
     const statsNode = document.querySelector("#stats");
     const downloadAllButton = document.querySelector("#downloadAllButton");
+    const clearHistoryButton = document.querySelector("#clearHistoryButton");
     const batches = new Map();
     let pollTimer = 0;
+    let renderedSignature = "";
 
-    textarea.addEventListener("input", updateLinkCount);
-    clearLinksButton.addEventListener("click", () => {
-      textarea.value = "";
-      errorText.textContent = "";
+    let nextUrlInputId = 2;
+
+    urlInputs.addEventListener("input", updateLinkCount);
+    urlInputs.addEventListener("keydown", (event) => {
+      if (!event.target.classList.contains("url-input") || event.key !== "Enter") return;
+      event.preventDefault();
+
+      const nextInput = event.target.nextElementSibling;
+      if (nextInput) {
+        nextInput.focus();
+        return;
+      }
+
+      addUrlInput("", true);
+    });
+    urlInputs.addEventListener("paste", (event) => {
+      if (!event.target.classList.contains("url-input")) return;
+      const pastedLinks = event.clipboardData.getData("text")
+        .split(/\r?\n/)
+        .map((link) => link.trim())
+        .filter(Boolean);
+      if (pastedLinks.length < 2) return;
+
+      event.preventDefault();
+      event.target.value = pastedLinks[0];
+      let previousInput = event.target;
+      pastedLinks.slice(1).forEach((link) => {
+        const input = createUrlInput(link);
+        previousInput.after(input);
+        previousInput = input;
+      });
       updateLinkCount();
-      textarea.focus();
+      previousInput.focus();
+    });
+    clearLinksButton.addEventListener("click", () => {
+      resetUrlInputs();
+      errorText.textContent = "";
     });
     downloadAllButton.addEventListener("click", downloadAll);
+    clearHistoryButton.addEventListener("click", clearHistory);
+    itemsNode.addEventListener("click", (event) => {
+      if (event.target.closest(".download-link")) {
+        setTimeout(refreshHistory, 1000);
+      }
+    });
     loadHistory();
 
     form.addEventListener("submit", async (event) => {
@@ -1041,14 +1326,14 @@ INDEX_HTML = r"""<!doctype html>
         const response = await fetch("/api/jobs", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ urls: textarea.value })
+          body: JSON.stringify({ urls: getUrlValues().join("\n") })
         });
         const data = await response.json();
         if (!response.ok) throw new Error(data.error || "Unable to start batch");
 
         batches.set(data.id, data);
-        textarea.value = "";
-        updateLinkCount();
+        renderedSignature = "";
+        resetUrlInputs();
         renderHistory();
         startPolling();
       } catch (error) {
@@ -1065,12 +1350,46 @@ INDEX_HTML = r"""<!doctype html>
       refreshHistory();
     }
 
+    function createUrlInput(value = "") {
+      const input = document.createElement("input");
+      input.className = "url-input";
+      input.id = `url-${nextUrlInputId++}`;
+      input.type = "url";
+      input.inputMode = "url";
+      input.autocomplete = "off";
+      input.spellcheck = false;
+      input.setAttribute("aria-describedby", "urlHint");
+      input.placeholder = "Paste a YouTube link";
+      input.value = value;
+      return input;
+    }
+
+    function addUrlInput(value = "", focus = false) {
+      const input = createUrlInput(value);
+      urlInputs.appendChild(input);
+      if (focus) input.focus();
+      updateLinkCount();
+      return input;
+    }
+
+    function resetUrlInputs() {
+      urlInputs.innerHTML = "";
+      const input = addUrlInput();
+      input.focus();
+    }
+
+    function getUrlValues() {
+      return Array.from(urlInputs.querySelectorAll(".url-input"))
+        .map((input) => input.value.trim())
+        .filter(Boolean);
+    }
+
     function updateLinkCount() {
-      const count = textarea.value
-        .split(/\r?\n/)
-        .map((link) => link.trim())
-        .filter(Boolean).length;
+      const count = getUrlValues().length;
       linkCount.textContent = `${count} ${count === 1 ? "link" : "links"} inserted`;
+      urlHint.textContent = count
+        ? "Press Enter to add another link."
+        : "Paste a YouTube link above.";
     }
 
     async function loadHistory() {
@@ -1091,11 +1410,15 @@ INDEX_HTML = r"""<!doctype html>
         return 0;
       }
 
-      batches.clear();
-      data.jobs.forEach((batch) => batches.set(batch.id, batch));
-      renderHistory();
+      const nextSignature = JSON.stringify(data.jobs);
+      if (nextSignature !== renderedSignature) {
+        batches.clear();
+        data.jobs.forEach((batch) => batches.set(batch.id, batch));
+        renderedSignature = nextSignature;
+        renderHistory();
+      }
       const active = data.jobs.reduce(
-        (total, batch) => total + batch.counts.queued + batch.counts.running,
+        (total, batch) => total + batch.counts.queued + batch.counts.running + batch.counts.stopping,
         0
       );
       if (active === 0) clearInterval(pollTimer);
@@ -1113,10 +1436,54 @@ INDEX_HTML = r"""<!doctype html>
         if (!response.ok) throw new Error(data.error || "Unable to retry item");
 
         batches.set(batchId, data);
+        renderedSignature = "";
         renderHistory();
         startPolling();
       } catch (error) {
         errorText.textContent = error.message;
+      }
+    }
+
+    async function stopItem(batchId, itemId) {
+      errorText.textContent = "";
+      try {
+        const response = await fetch(`/api/jobs/${batchId}/items/${itemId}/stop`, {
+          method: "POST"
+        });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || "Unable to stop item");
+        batches.set(batchId, data);
+        renderedSignature = "";
+        renderHistory();
+        if (data.counts.stopping > 0) startPolling();
+      } catch (error) {
+        errorText.textContent = error.message;
+      }
+    }
+
+    async function clearHistory() {
+      const confirmed = window.confirm(
+        "Remove completed, failed, and stopped items from the current list? Active conversions will stay, and MP3 files will not be deleted."
+      );
+      if (!confirmed) return;
+
+      clearHistoryButton.disabled = true;
+      errorText.textContent = "";
+
+      try {
+        const response = await fetch("/api/jobs/clear-history", { method: "POST" });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || "Unable to clear queue items");
+
+        batches.clear();
+        data.jobs.forEach((batch) => batches.set(batch.id, batch));
+        renderedSignature = "";
+        renderHistory();
+        if (data.preservedActive > 0) startPolling();
+      } catch (error) {
+        errorText.textContent = error.message;
+      } finally {
+        clearHistoryButton.disabled = false;
       }
     }
 
@@ -1126,6 +1493,7 @@ INDEX_HTML = r"""<!doctype html>
       ));
       if (!urls.length) return;
 
+      downloadAllButton.disabled = true;
       urls.forEach((url, index) => {
         setTimeout(() => {
           const link = document.createElement("a");
@@ -1136,6 +1504,16 @@ INDEX_HTML = r"""<!doctype html>
           link.remove();
         }, index * 350);
       });
+
+      setTimeout(async () => {
+        try {
+          await refreshHistory();
+        } catch (error) {
+          errorText.textContent = error.message;
+        } finally {
+          downloadAllButton.disabled = false;
+        }
+      }, urls.length * 350 + 1000);
     }
 
     function renderHistory() {
@@ -1144,15 +1522,19 @@ INDEX_HTML = r"""<!doctype html>
         total: total.total + batch.counts.total,
         queued: total.queued + batch.counts.queued,
         running: total.running + batch.counts.running,
+        stopping: total.stopping + batch.counts.stopping,
+        stopped: total.stopped + batch.counts.stopped,
         done: total.done + batch.counts.done,
         error: total.error + batch.counts.error
-      }), { total: 0, queued: 0, running: 0, done: 0, error: 0 });
+      }), { total: 0, queued: 0, running: 0, stopping: 0, stopped: 0, done: 0, error: 0 });
 
       statsNode.innerHTML = `
         <span class="stat">${counts.total} total</span>
         <span class="stat">${counts.queued} waiting</span>
         <span class="stat">${counts.running} running</span>
-        <span class="stat">${counts.done} ready</span>
+        <span class="stat">${counts.stopping} stopping</span>
+        <span class="stat">${counts.stopped} stopped</span>
+        <span class="stat">${counts.done} completed</span>
         <span class="stat">${counts.error} failed</span>
       `;
 
@@ -1160,6 +1542,7 @@ INDEX_HTML = r"""<!doctype html>
         batch.items.flatMap((item) => item.downloadUrls || [])
       ));
       downloadAllButton.hidden = readyDownloads.length === 0;
+      clearHistoryButton.hidden = counts.done + counts.error + counts.stopped === 0;
 
       if (!history.length) {
         itemsNode.innerHTML = `<div class="empty"><p>No batch is running yet.</p></div>`;
@@ -1167,26 +1550,42 @@ INDEX_HTML = r"""<!doctype html>
       }
 
       itemsNode.innerHTML = history.map((batch, batchIndex) => {
+        const batchTime = new Date(batch.createdAt * 1000).toLocaleTimeString([], {
+          hour: "2-digit",
+          minute: "2-digit"
+        });
         const items = batch.items.map((item) => {
         const progressValue = Number((item.progress || "0").replace("%", "")) || 0;
         const fileName = item.files && item.files.length ? item.files.join(", ") : "";
         const displayName = fileName || item.title || item.url;
         const downloads = item.downloadUrls.map((url, index) => (
-          `<a class="button" href="${url}">Download MP3 ${index + 1}</a>`
+          `<a class="button download-link" href="${url}" download>Download MP3 ${index + 1}</a>`
         )).join("");
-        const retry = item.status === "error"
+        const retry = item.status === "error" || item.status === "stopped"
           ? `<button class="button retry-button" type="button" onclick="retryItem('${batch.id}', '${item.id}')">Retry</button>`
           : "";
+        const stop = item.status === "queued" || item.status === "running"
+          ? `<button class="button retry-button" type="button" onclick="stopItem('${batch.id}', '${item.id}')">Stop</button>`
+          : "";
+        const downloaded = item.files.length > 0
+          && item.downloadedFiles.length === item.files.length
+          ? `<span class="download-state">Downloaded</span>`
+          : "";
+        const missing = item.missingFiles.length
+          ? `<div class="missing-file">${item.missingFiles.length === 1 ? "File is" : "Files are"} no longer available on disk</div>`
+          : "";
+        const statusLabel = item.status === "done" ? "completed" : item.status;
 
         return `
-          <article class="item">
+          <article class="item ${item.status}">
             <div class="item-main">
-              <span class="badge ${item.status}">${item.status}</span>
+              <span class="badge ${item.status}">${statusLabel}</span>
               <div>
                 <div class="url">${escapeHtml(displayName)}</div>
                 <div class="message">${escapeHtml(item.message || "")}</div>
+                ${downloaded}${missing}
               </div>
-              <div class="downloads">${downloads}${retry}</div>
+              <div class="downloads">${downloads}${retry}${stop}</div>
             </div>
             <progress max="100" value="${progressValue}"></progress>
           </article>
@@ -1196,7 +1595,7 @@ INDEX_HTML = r"""<!doctype html>
         return `
           <section class="batch-group">
             <div class="batch-label">
-              <span>Batch ${batchIndex + 1}</span>
+              <span>Batch ${batchIndex + 1} · ${batchTime}</span>
               <span>${batch.items.length} ${batch.items.length === 1 ? "item" : "items"}</span>
             </div>
             ${items}
