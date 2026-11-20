@@ -121,6 +121,60 @@ def check(window: QWidget) -> dict:
     return {"problems": problems}
 
 
+LONG_SAVE_DIR = Path(
+    "C:/Users/a.very.long.user.name/OneDrive - Some Company Name/Music/Downloaded from YouTube/Converted MP3 files"
+)
+
+
+def measure_dialog(dialog: QWidget, app: QApplication) -> dict:
+    dialog.show()
+    # Not adjustSize(): it clamps to the offscreen platform's small virtual
+    # screen, which says nothing about the real 910x512 / 1366x768 screens.
+    dialog.resize(dialog.sizeHint())
+    for _ in range(5):
+        app.processEvents()
+    result = check(dialog)
+    result.update(
+        hint=list(dialog.sizeHint().toTuple()),
+        minimum=list(dialog.minimumSizeHint().toTuple()),
+        size=list(dialog.size().toTuple()),
+    )
+    return result
+
+
+def measure_dialogs(window, app: QApplication) -> dict:
+    """Settings (Advanced open, long folder) and Update in its tallest states."""
+    from core.cookies import CookieResult
+    from core.updater import Stage, UpdateKind, UpdateResult
+    from ui.dialog_texts import BLOCKED_TEXT
+
+    window.services.settings.set_save_dir(LONG_SAVE_DIR)
+    settings = window.open_settings()
+    settings.set_advanced_open(True)
+    settings._show_folder_message("Can't save files in this folder. Choose another folder.")
+    settings._show_cookie_result(CookieResult(False, "This doesn't look like a cookies.txt file. Choose another one."))
+    settings.versions.set("2025.10.22")
+    results = {"settings": measure_dialog(settings, app)}
+    settings.close()
+
+    update = window.open_update()
+    states = {}
+    update.progress.show()
+    update.cancel_button.show()
+    update._on_progress(Stage.DOWNLOADING, 50, 100)
+    states["update_progress"] = measure_dialog(update, app)
+    update._on_finished(UpdateResult(UpdateKind.FAILED, message="Couldn't update. Your current version still works.",
+                                     details="network error: x"))
+    states["update_failed"] = measure_dialog(update, app)
+    update._set_message(BLOCKED_TEXT, "warn")
+    states["update_blocked"] = measure_dialog(update, app)
+    update.close()
+    for _ in range(5):
+        app.processEvents()
+    results.update(states)
+    return results
+
+
 def main() -> int:
     sizes = [arg for arg in sys.argv[2:] if "x" in arg and not arg.startswith("--")]
     grab_dir = None
@@ -161,6 +215,7 @@ def main() -> int:
         for _ in range(5):
             app.processEvents()
         result = check(window)
+        dialogs = measure_dialogs(window, app)
         convert = window.input_panel.convert_button
         top_left = convert.mapTo(window, convert.rect().topLeft())
         convert_rect = QRect(top_left, convert.size())
@@ -187,6 +242,9 @@ def main() -> int:
                 )
             ),
             summary=window.queue_panel.summary.text(),
+            dialogs=dialogs,
+            settings_button_visible=window.settings_button.isVisible(),
+            update_link_visible=window.update_link.isVisible(),
         )
         if grab_dir is not None:
             window.grab().save(str(grab_dir / f"dpr{DPR}-{size}.png"))

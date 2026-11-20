@@ -92,6 +92,35 @@ class LayoutMatrixTests(unittest.TestCase):
                     self.assertIn("1 ready", result["summary"])
                     self.assertIn("1 saved", result["summary"])
 
+    def test_settings_and_update_entry_points_visible(self):
+        for dpr in DPRS:
+            for size, result in self.results[dpr].items():
+                with self.subTest(dpr=dpr, size=size):
+                    self.assertTrue(result["settings_button_visible"])
+                    self.assertTrue(result["update_link_visible"])
+
+    def test_dialogs_fit_inside_the_window(self):
+        """Settings (Advanced open, long folder, both messages) and Update
+        (downloading / failed / blocked): size hint and shown size fit."""
+        for dpr in DPRS:
+            for size, result in self.results[dpr].items():
+                width, height = (int(value) for value in size.split("x"))
+                for name, dialog in result["dialogs"].items():
+                    with self.subTest(dpr=dpr, size=size, dialog=name):
+                        self.assertLessEqual(dialog["hint"][0], width)
+                        self.assertLessEqual(dialog["hint"][1], height)
+                        self.assertLessEqual(dialog["size"][0], width)
+                        self.assertLessEqual(dialog["size"][1], height)
+                        self.assertGreaterEqual(dialog["size"][0], dialog["hint"][0])
+                        self.assertGreaterEqual(dialog["size"][1], dialog["hint"][1])
+
+    def test_dialogs_not_clipped(self):
+        for dpr in DPRS:
+            for size, result in self.results[dpr].items():
+                for name, dialog in result["dialogs"].items():
+                    with self.subTest(dpr=dpr, size=size, dialog=name):
+                        self.assertEqual(dialog["problems"], [])
+
     def test_large_screens_show_full_notice(self):
         for dpr in DPRS:
             self.assertFalse(self.results[dpr]["1920x1080"]["compact_notice"])

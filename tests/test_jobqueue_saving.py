@@ -88,7 +88,8 @@ class SaveStateTests(unittest.TestCase):
         self.assertEqual(self.queue.unsaved(), [])
         self.assertTrue(self.queue.retry(item_id))
         item = self.queue.get(item_id)
-        self.assertEqual(item.phase, Phase.WAITING)
+        # The worker may already have picked the job up (race-free check).
+        self.assertIn(item.phase, (Phase.WAITING, Phase.DOWNLOADING))
         self.assertIsNone(item.staged_path)
         self.assertIsNone(item.save_error)
         self.assertFalse(item.staged_missing)

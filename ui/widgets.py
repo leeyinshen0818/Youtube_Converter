@@ -108,6 +108,37 @@ class FlowLayout(QLayout):
         return used - rect.y() + margins.bottom()
 
 
+def fitted_size_hint(widget: QWidget, base: QSize) -> QSize:
+    """Size hint for a top-level window whose layout wraps text: at least the
+    minimum width, and exactly as tall as the layout needs at that width
+    (Qt's default measures the height at the narrower hint width)."""
+    layout = widget.layout()
+    width = max(base.width(), widget.minimumWidth())
+    if layout is None or not layout.hasHeightForWidth():
+        return QSize(width, base.height())
+    return QSize(width, layout.totalHeightForWidth(width))
+
+
+def fit_to_content(window: QWidget) -> None:
+    """Make a window with wrapping text exactly as tall as its content.
+
+    The minimum height is the height needed at the minimum width (the
+    tallest case), set explicitly because Qt's own minimum measures wrapped
+    text at an even narrower width and leaves an empty gap.
+    """
+    layout = window.layout()
+    if layout is None:
+        return
+    layout.activate()
+    width = max(window.minimumWidth(), layout.minimumSize().width())
+    height = layout.totalHeightForWidth(width) if layout.hasHeightForWidth() else layout.sizeHint().height()
+    window.setMinimumHeight(height)
+    # An unshown widget reports a default width, so start at the minimum.
+    current = max(window.width(), width) if window.isVisible() else width
+    needed = layout.totalHeightForWidth(current) if layout.hasHeightForWidth() else height
+    window.resize(current, max(height, needed))  # never below the minimum
+
+
 class Card(QFrame):
     """White rounded panel with a vertical layout."""
 

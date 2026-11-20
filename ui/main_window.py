@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QMainWindow,
     QMessageBox,
+    QPushButton,
     QVBoxLayout,
     QWidget,
 )
@@ -28,9 +29,11 @@ from core import tools
 from core.converter import ConverterConfig, remove_dir
 from core.jobqueue import ItemSnapshot, JobQueue, factory_for
 from core.saver import default_save_dir, discard_staged
+from core.updater import tools_busy
 from core.urls import ValidLink
 from core.version import APP_VERSION
 from ui import theme
+from ui.dialog_texts import SETTINGS_BUTTON_TEXT, UPDATE_LINK_TEXT
 from ui.input_panel import InputPanel
 from ui.messages import (
     RunTracker,
@@ -44,6 +47,9 @@ from ui.queue_delegate import RowAction
 from ui.queue_model import QueueModel
 from ui.queue_panel import QueuePanel
 from ui.saving import SaveController
+from ui.services import AppServices, VersionCache
+from ui.settings_dialog import SettingsDialog
+from ui.update_dialog import UpdateDialog
 from ui.theme import SPACE
 
 WINDOW_TITLE = f"YouTube to MP3 Converter {APP_VERSION}"
@@ -110,13 +116,23 @@ class MainWindow(QMainWindow):
         ready_root: Path | None = None,
         save_dir: Path | None = None,
         shell: ShellActions | None = None,
+        services: AppServices | None = None,
     ) -> None:
+        """``services`` gives access to settings, cookies, yt-dlp and the
+        network. Without it nothing outside the window is touched: settings
+        stay in memory (starting with ``save_dir``), no yt-dlp is found and
+        the network is off."""
         super().__init__()
         self.setWindowTitle(WINDOW_TITLE)
         self.temp_root = temp_root
         self.ready_root = ready_root
-        self.save_dir = save_dir or default_save_dir()
+        if services is not None and save_dir is not None:
+            raise ValueError("pass save_dir through services.settings")
+        self.services = services or AppServices.detached(save_dir)
+        self.versions = VersionCache(self.services, self)
         self.shell = shell or ShellActions()
+        self.settings_dialog: SettingsDialog | None = None
+        self.update_dialog: UpdateDialog | None = None
         clean_folder(temp_root)
         clean_folder(ready_root)
 
@@ -136,14 +152,21 @@ class MainWindow(QMainWindow):
         central = QWidget()
         central.setObjectName("central")
         outer = QVBoxLayout(central)
-        outer.setContentsMargins(SPACE.lg, SPACE.lg, SPACE.lg, SPACE.lg)
-        outer.setSpacing(SPACE.md)
+        # The slim top bar (Settings) and footer (Update link) sit in the
+        # outer margins' space so the columns keep their height.
+        outer.setContentsMargins(SPACE.lg, 0, SPACE.lg, 0)
+        outer.setSpacing(0)
 
-        # Reserved for Stage 4 (Settings gear). Empty and hidden for now.
         self.top_bar = QWidget()
         self.top_bar.setObjectName("topBar")
-        QHBoxLayout(self.top_bar).setContentsMargins(0, 0, 0, 0)
-        self.top_bar.hide()
+        top = QHBoxLayout(self.top_bar)
+        top.setContentsMargins(0, 0, 0, 0)
+        top.addStretch(1)
+        self.settings_button = QPushButton(SETTINGS_BUTTON_TEXT)
+        theme.set_kind(self.settings_button, "link")
+        self.settings_button.setFont(theme.font(theme.FONT.small))
+        self.settings_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        top.addWidget(self.settings_button)
         outer.addWidget(self.top_bar)
 
         self.body = QHBoxLayout()
@@ -155,11 +178,16 @@ class MainWindow(QMainWindow):
         self.body.addWidget(self.queue_panel, 3)
         outer.addLayout(self.body, 1)
 
-        # Reserved for Stage 4 ("Downloads not working? Update"). Hidden for now.
         self.footer = QWidget()
         self.footer.setObjectName("footer")
-        QHBoxLayout(self.footer).setContentsMargins(0, 0, 0, 0)
-        self.footer.hide()
+        bottom = QHBoxLayout(self.footer)
+        bottom.setContentsMargins(0, 0, 0, 0)
+        self.update_link = QPushButton(UPDATE_LINK_TEXT)
+        theme.set_kind(self.update_link, "link")
+        self.update_link.setFont(theme.font(theme.FONT.small))
+        self.update_link.setCursor(Qt.CursorShape.PointingHandCursor)
+        bottom.addWidget(self.update_link)
+        bottom.addStretch(1)
         outer.addWidget(self.footer)
         self.setCentralWidget(central)
 
@@ -173,6 +201,8 @@ class MainWindow(QMainWindow):
             panel.download_all_button,
             panel.open_folder_button,
             panel.clear_button,
+            self.update_link,
+            self.settings_button,
         ]
         for first, second in zip(order, order[1:]):
             self.setTabOrder(first, second)
@@ -182,6 +212,8 @@ class MainWindow(QMainWindow):
         panel.downloadAllRequested.connect(self.download_all)
         panel.openFolderRequested.connect(self.open_folder)
         panel.clearFinishedRequested.connect(self.clear_finished)
+        self.settings_button.clicked.connect(self.open_settings)
+        self.update_link.clicked.connect(self.open_update)
         self.bridge.countsChanged.connect(self._on_counts_changed, Qt.ConnectionType.QueuedConnection)
         self.saver.itemSaved.connect(self._on_item_saved)
         self.saver.itemFailed.connect(self._on_item_save_failed)
@@ -194,6 +226,11 @@ class MainWindow(QMainWindow):
         self._close_timer = QTimer(self)
         self._close_timer.setInterval(CLOSE_POLL_MS)
         self._close_timer.timeout.connect(self._poll_close)
+
+    @property
+    def save_dir(self) -> Path:
+        """The user's save folder (Settings), read fresh on every use."""
+        return self.services.settings.save_dir
 
     # --- dialogs (replaceable in tests) -------------------------------------
 
@@ -209,6 +246,41 @@ class MainWindow(QMainWindow):
         box.setEscapeButton(reject)
         box.exec()
         return box.clickedButton() is accept
+
+    # --- settings and update ------------------------------------------------
+
+    def open_settings(self) -> SettingsDialog:
+        """Show Settings (modal, non-blocking: ``open()`` not ``exec()``)."""
+        dialog = SettingsDialog(self.services, self.versions, self)
+        dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        dialog.setWindowModality(Qt.WindowModality.ApplicationModal)
+        dialog.saveDirChanged.connect(self._on_save_dir_changed)
+        dialog.destroyed.connect(self._forget_settings_dialog)
+        self.settings_dialog = dialog
+        dialog.open()
+        return dialog
+
+    def open_update(self) -> UpdateDialog:
+        dialog = UpdateDialog(self.services, self.versions, self.downloads_running, self)
+        dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        dialog.setWindowModality(Qt.WindowModality.ApplicationModal)
+        dialog.destroyed.connect(self._forget_update_dialog)
+        self.update_dialog = dialog
+        dialog.open()
+        return dialog
+
+    def downloads_running(self) -> bool:
+        """yt-dlp may be running (its exe is locked on Windows)."""
+        return tools_busy(self.queue.has_active(), self.queue.running_count)
+
+    def _forget_settings_dialog(self) -> None:
+        self.settings_dialog = None
+
+    def _forget_update_dialog(self) -> None:
+        self.update_dialog = None
+
+    def _on_save_dir_changed(self, folder: Path) -> None:
+        self.queue_panel.set_save_location(save_location_label(folder))
 
     # --- queue -------------------------------------------------------------
 

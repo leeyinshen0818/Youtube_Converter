@@ -265,6 +265,17 @@ QPushButton[{KIND}="primary"]:hover, QPushButton[{KIND}="convert"]:hover {{
 QPushButton[{KIND}="primary"]:focus, QPushButton[{KIND}="convert"]:focus {{
     border: 2px solid {c.text};
 }}
+QPushButton[{KIND}="link"] {{
+    background: transparent;
+    border: 1px solid transparent;
+    color: {c.accent};
+    padding: 0 {s.xs}px;
+    font-weight: normal;
+    text-decoration: underline;
+}}
+QPushButton[{KIND}="link"]:hover {{ color: {c.accent_dark}; background: transparent; border-color: transparent; }}
+QPushButton[{KIND}="link"]:focus {{ border: 1px solid {c.accent_focus}; }}
+QPushButton[{KIND}="link"]:disabled {{ background: transparent; border-color: transparent; color: {c.muted}; }}
 QPushButton:disabled, QPushButton[{KIND}="convert"]:disabled {{
     background: {c.disabled_bg};
     border-color: {c.disabled_bg};
