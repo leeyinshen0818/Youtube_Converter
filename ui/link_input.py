@@ -10,7 +10,7 @@ from __future__ import annotations
 from bisect import bisect_left
 from dataclasses import dataclass
 
-from PySide6.QtCore import QEvent, Qt, Signal
+from PySide6.QtCore import QEvent, QMimeData, Qt, Signal
 from PySide6.QtGui import QColor, QKeyEvent, QTextCharFormat, QTextCursor
 from PySide6.QtWidgets import QPlainTextEdit, QTextEdit, QToolTip, QWidget
 
@@ -29,6 +29,13 @@ class Utf16Map:
 
     def to_utf16(self, index: int) -> int:
         return index + bisect_left(self._wide, index)
+
+
+def is_single_link(text: str) -> bool:
+    """One piece of text with no line break or inner space, not ending in a
+    newline (pasted text that already ends in one is left alone)."""
+    stripped = text.strip()
+    return bool(stripped) and "\n" not in text and not any(char.isspace() for char in stripped)
 
 
 def utf16_length(text: str) -> int:
@@ -80,15 +87,37 @@ class LinkInput(QPlainTextEdit):
         cursor.beginEditBlock()
         if cursor.hasSelection():
             cursor.removeSelectedText()
+        single = is_single_link(text)
         if cursor.positionInBlock() > 0:
             text = "\n" + text  # start on a new line
         rest_of_line = cursor.block().text()[cursor.positionInBlock():]
         if rest_of_line.strip() and not text.endswith("\n"):
             text += "\n"  # keep what was after the cursor on its own line
+        elif single and not rest_of_line.strip():
+            text += "\n"  # fresh empty line, ready for the next link
         cursor.insertText(text)
         cursor.endEditBlock()
         self.setTextCursor(cursor)
         self.ensureCursorVisible()
+
+    def insertFromMimeData(self, source: QMimeData) -> None:  # noqa: N802
+        """Ctrl+V / middle-click paste. A single link pasted at the end of a
+        line (or of the box) is followed by a newline, so the cursor waits on
+        a fresh empty line. Everything else pastes exactly as Qt does."""
+        if source.hasText():
+            text = source.text().replace("\r\n", "\n").replace("\r", "\n")
+            cursor = self.textCursor()
+            if is_single_link(text):
+                cursor.beginEditBlock()
+                if cursor.hasSelection():
+                    cursor.removeSelectedText()
+                at_line_end = not cursor.block().text()[cursor.positionInBlock():].strip()
+                cursor.insertText(text + "\n" if at_line_end else text)
+                cursor.endEditBlock()
+                self.setTextCursor(cursor)
+                self.ensureCursorVisible()
+                return
+        super().insertFromMimeData(source)
 
     # --- text replacement -----------------------------------------------------
 
@@ -190,4 +219,4 @@ class LinkInput(QPlainTextEdit):
         return super().viewportEvent(event)
 
 
-__all__ = ["LinkInput", "Problem", "Utf16Map", "utf16_length", "PLACEHOLDER"]
+__all__ = ["LinkInput", "Problem", "Utf16Map", "is_single_link", "utf16_length", "PLACEHOLDER"]
