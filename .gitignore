@@ -9,3 +9,7 @@ cookies.txt
 build/
 dist/
 *.spec
+
+# Stage 5 screenshot matrix output
+screenshots/
+.vscode/

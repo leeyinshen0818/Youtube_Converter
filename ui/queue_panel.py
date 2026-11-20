@@ -40,6 +40,9 @@ class QueueView(QListView):
         super().__init__(parent)
         self.delegate = QueueDelegate(self)
         self.setItemDelegate(self.delegate)
+        # Windows gives item views their own 9 pt font, which the app font
+        # does not override; rows must use the body font like everything else.
+        self.setFont(theme.font(FONT.body))
         self.setUniformItemSizes(False)
         self.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
         self.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)

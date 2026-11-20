@@ -107,8 +107,14 @@ class RowFonts:
 
     @classmethod
     def from_font(cls, font: QFont) -> "RowFonts":
+        # Pin family and size explicitly: a copied font whose size is only
+        # inherited gets re-resolved by QPainter.setFont against the paint
+        # device's font, so the text would be drawn at another size than it
+        # was measured (and elided) with.
         body = QFont(font)
-        small = QFont(font)
+        body.setFamilies(font.families() or [font.family()])
+        body.setPointSizeF(font.pointSizeF())
+        small = QFont(body)
         small.setPointSizeF(FONT.small)
         bold = QFont(body)
         bold.setWeight(QFont.Weight.Bold)
