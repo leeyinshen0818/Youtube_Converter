@@ -9,3 +9,11 @@ cookies.txt
 build/
 dist/
 *.spec
+
+# Stage 5 screenshot matrix output
+screenshots/
+.vscode/
+
+# Tools placed by hand when running from source (core/tools.py looks here)
+/bin/
+/yt-dlp.exe
