@@ -59,27 +59,38 @@ Run the tests. They don't use the network or the real app folders:
 
 ## Build the Windows app
 
-You need `ffmpeg`, `ffprobe` and `node` on `PATH`, plus the `.venv` from
-above. Then run:
+The build makes **one file**, `dist\YouTubeMP3Converter.exe`, that you can
+copy to any Windows 10/11 PC. Python doesn't need to be installed there.
 
-```powershell
-powershell -ExecutionPolicy Bypass -File .\build_windows.ps1
-```
+1. Have the `.venv` from above, and `node` on `PATH`.
+2. Optional, but it makes the exe about 200 MB smaller: download an
+   "essentials" build of ffmpeg (for example
+   `ffmpeg-release-essentials.zip` from gyan.dev). Copy its `ffmpeg.exe` and
+   `ffprobe.exe` into `.build-assets\ffmpeg-essentials\`. Without them, the
+   build uses `ffmpeg` and `ffprobe` from `PATH` and prints a warning.
+3. The logo is `icon\logo.png`. The build turns it into the exe and window
+   icon at every size from 16 to 256 px. A preview of the small sizes is
+   saved to `screenshots\icon_sheet.png`.
+4. Run:
+
+   ```powershell
+   powershell -ExecutionPolicy Bypass -File .\build_windows.ps1
+   ```
 
 The script:
 
-- installs `requirements.txt` and `requirements-build.txt`;
 - downloads the latest official `yt-dlp.exe` and checks it against the
   release's `SHA2-256SUMS` (the build stops on any mismatch);
-- copies `ffmpeg`, `ffprobe` and `node` from `PATH`;
-- writes the icon and the version resource (the version comes from
-  `core\version.py`).
+- embeds ffmpeg, ffprobe, node and yt-dlp in the exe, and prints which files
+  it used and their sizes;
+- checks that no `cookies.txt` or `settings.json` ended up inside;
+- writes `dist\YouTubeMP3Converter.exe.sha256`.
 
-Results:
+Notes:
 
-- `dist\YouTubeMP3Converter\`: the app folder. Run
-  `YouTubeMP3Converter.exe`; the four tools are in `bin\`.
-- `dist\YouTubeMP3Converter-<version>.zip`: the same folder, zipped for sharing.
-
-The built app doesn't need Python. The exe isn't code-signed, so Windows
-SmartScreen may warn the first time it runs.
+- Each start unpacks the app to a temporary folder (removed again when the
+  app closes), so the first window takes a few seconds to appear.
+- Only one copy runs at a time; opening it again does nothing while it's
+  already open.
+- The exe isn't code-signed, so Windows SmartScreen may warn the first time
+  it runs.

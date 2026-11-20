@@ -1,7 +1,8 @@
-# Build the Windows app: dist\YouTubeMP3Converter\ (onedir) and
-# dist\YouTubeMP3Converter-<version>.zip.
+# Build the Windows app as ONE file: dist\YouTubeMP3Converter.exe
+# (plus dist\YouTubeMP3Converter.exe.sha256).
 #
-# Needs: .venv with Python, and ffmpeg, ffprobe and node on PATH.
+# Needs: .venv with Python, node on PATH, and ffmpeg/ffprobe either in
+# .build-assets\ffmpeg-essentials\ (preferred, much smaller) or on PATH.
 # Downloads the latest official yt-dlp.exe (verified against SHA2-256SUMS).
 # Never bundles cookies.txt or anything from %LOCALAPPDATA%.
 
@@ -11,25 +12,36 @@ $projectDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $python = Join-Path $projectDir ".venv\Scripts\python.exe"
 $helper = Join-Path $projectDir "scripts\build_support.py"
 $assets = Join-Path $projectDir ".build-assets"
-$mediaDir = Join-Path $assets "bin"          # ffmpeg, ffprobe, node copied from PATH
-$ytdlpDir = Join-Path $assets "ytdlp"        # freshly downloaded yt-dlp.exe
-$iconPng = Join-Path $projectDir "icon\icon1.png"
+$essentialsDir = Join-Path $assets "ffmpeg-essentials"   # optional, placed by hand
+$ytdlpDir = Join-Path $assets "ytdlp"                    # freshly downloaded yt-dlp.exe
+$logo = Join-Path $projectDir "icon\logo.png"
 $iconIco = Join-Path $assets "app.ico"
+$iconSheet = Join-Path $projectDir "screenshots\icon_sheet.png"
 $versionFile = Join-Path $projectDir "windows_version_info.txt"
 # Kept inside .build-assets so an old build\ folder or .spec file is never touched.
 $workDir = Join-Path $assets "pyinstaller-work"
 $specDir = Join-Path $assets "pyinstaller-spec"
 $distRoot = Join-Path $projectDir "dist"
 $appName = "YouTubeMP3Converter"
-$appDir = Join-Path $distRoot $appName
+$exe = Join-Path $distRoot "$appName.exe"
+$hashFile = "$exe.sha256"
 
 function Invoke-Checked([string]$what, [scriptblock]$block) {
     & $block
     if ($LASTEXITCODE -ne 0) { throw "$what failed (exit code $LASTEXITCODE)." }
 }
 
+function Resolve-OnPath([string]$name) {
+    $command = Get-Command $name -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $command) { throw "$name was not found on PATH. Install it before building." }
+    $item = Get-Item $command.Source
+    # WinGet puts links on PATH; bundle the real file behind them.
+    if ($item.LinkType -eq "SymbolicLink") { return (Get-Item $item.Target[0]).FullName }
+    return $item.FullName
+}
+
 if (-not (Test-Path $python)) { throw "Project virtual environment not found. Create .venv first (see README)." }
-if (-not (Test-Path $iconPng)) { throw "App logo not found at icon\icon1.png." }
+if (-not (Test-Path $logo)) { throw "App logo not found at icon\logo.png." }
 
 Invoke-Checked "Installing requirements" {
     & $python -m pip install -r (Join-Path $projectDir "requirements.txt") -r (Join-Path $projectDir "requirements-build.txt")
@@ -37,24 +49,45 @@ Invoke-Checked "Installing requirements" {
 
 $version = (& $python $helper version).Trim()
 if ($LASTEXITCODE -ne 0 -or -not $version) { throw "Could not read APP_VERSION from core\version.py." }
-Write-Host "Building $appName $version" -ForegroundColor Cyan
+Write-Host "Building $appName $version (one file)" -ForegroundColor Cyan
 
-New-Item -ItemType Directory -Force -Path $mediaDir, $ytdlpDir | Out-Null
-
-# ffmpeg, ffprobe, node: copy the real exe behind any PATH entry (WinGet uses links).
-foreach ($toolName in @("ffmpeg", "ffprobe", "node")) {
-    $command = Get-Command $toolName -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
-    if (-not $command) { throw "$toolName was not found on PATH. Install it before building." }
-    $item = Get-Item $command.Source
-    $source = if ($item.LinkType -eq "SymbolicLink") { $item.Target[0] } else { $item.FullName }
-    Copy-Item -LiteralPath $source -Destination (Join-Path $mediaDir "$toolName.exe") -Force
+# --- tools ------------------------------------------------------------------
+$essentialFfmpeg = Join-Path $essentialsDir "ffmpeg.exe"
+$essentialFfprobe = Join-Path $essentialsDir "ffprobe.exe"
+if ((Test-Path $essentialFfmpeg) -and (Test-Path $essentialFfprobe)) {
+    $ffmpeg = $essentialFfmpeg
+    $ffprobe = $essentialFfprobe
+} else {
+    Write-Warning ("ffmpeg.exe and ffprobe.exe were not both found in $essentialsDir. " +
+        "Using the copies on PATH instead; if those are 'full' builds the exe will be MUCH larger " +
+        "(about 200 MB each instead of about 100 MB). See README, 'Build the Windows app', step 2.")
+    $ffmpeg = Resolve-OnPath "ffmpeg"
+    $ffprobe = Resolve-OnPath "ffprobe"
 }
+$node = Resolve-OnPath "node"
 
+New-Item -ItemType Directory -Force -Path $ytdlpDir | Out-Null
 # yt-dlp.exe: latest official release; the helper exits 1 on any hash or version problem.
 Invoke-Checked "Downloading and verifying yt-dlp.exe" { & $python $helper ytdlp $ytdlpDir }
-Invoke-Checked "Creating the icon" { & $python $helper icon $iconPng $iconIco }
+$ytdlp = Join-Path $ytdlpDir "yt-dlp.exe"
+
+$tools = [ordered]@{ "ffmpeg.exe" = $ffmpeg; "ffprobe.exe" = $ffprobe; "node.exe" = $node; "yt-dlp.exe" = $ytdlp }
+Write-Host ""
+Write-Host "Tools embedded in bin\:" -ForegroundColor Cyan
+foreach ($entry in $tools.GetEnumerator()) {
+    if (-not (Test-Path $entry.Value)) { throw "Missing tool: $($entry.Value)" }
+    $file = Get-Item $entry.Value
+    if ($file.Name -ne $entry.Key) { throw "Expected a file named $($entry.Key), got $($file.FullName)" }
+    Write-Host ("  {0,-12} {1,8:N1} MB  {2}" -f $entry.Key, ($file.Length / 1MB), $file.FullName)
+}
+Write-Host ""
+
+# --- icon and version resource ------------------------------------------------
+Invoke-Checked "Creating the icon" { & $python $helper icon $logo $iconIco }
+Invoke-Checked "Rendering the icon sheet" { & $python $helper icon-sheet $iconIco $iconSheet }
 Invoke-Checked "Writing the version resource" { & $python $helper version-info $versionFile }
 
+# --- PyInstaller ----------------------------------------------------------------
 # Qt modules the app never imports (it uses QtCore, QtGui and QtWidgets only).
 $excluded = @(
     "tkinter", "PySide6.QtNetwork", "PySide6.QtQml", "PySide6.QtQuick", "PySide6.QtQuickWidgets",
@@ -68,13 +101,17 @@ $excluded = @(
     "PySide6.QtPositioning", "PySide6.QtSerialPort", "PySide6.QtStateMachine", "PySide6.QtTextToSpeech"
 )
 $excludeArgs = foreach ($name in $excluded) { "--exclude-module"; $name }
+$binaryArgs = foreach ($path in $tools.Values) { "--add-binary"; "$path;bin" }
+
+foreach ($old in @($exe, $hashFile)) { if (Test-Path $old) { Remove-Item -LiteralPath $old -Force } }
 
 Invoke-Checked "PyInstaller" {
     & $python -m PyInstaller `
         --noconfirm `
         --clean `
-        --onedir `
+        --onefile `
         --windowed `
+        --noupx `
         --name $appName `
         --distpath $distRoot `
         --workpath $workDir `
@@ -82,36 +119,19 @@ Invoke-Checked "PyInstaller" {
         --icon $iconIco `
         --version-file $versionFile `
         --add-data "$iconIco;icon" `
-        --add-data "$iconPng;icon" `
+        @binaryArgs `
         @excludeArgs `
         (Join-Path $projectDir "main.py")
 }
-# ui\app.py uses icon\app.ico for the window (icon1.png is its fallback).
-$bundledIcon = Join-Path $appDir "_internal\icon\app.ico"
-if (-not (Test-Path $bundledIcon)) { throw "Bundled icon missing: $bundledIcon" }
+if (-not (Test-Path $exe)) { throw "PyInstaller did not produce $exe" }
 
-# Tools go in bin\ next to the exe (core\tools.py looks in <app>\bin first).
-$binDir = Join-Path $appDir "bin"
-New-Item -ItemType Directory -Force -Path $binDir | Out-Null
-foreach ($tool in @(
-    (Join-Path $mediaDir "ffmpeg.exe"), (Join-Path $mediaDir "ffprobe.exe"),
-    (Join-Path $mediaDir "node.exe"), (Join-Path $ytdlpDir "yt-dlp.exe")
-)) {
-    if (-not (Test-Path $tool)) { throw "Missing tool: $tool" }
-    Copy-Item -LiteralPath $tool -Destination $binDir -Force
-}
-foreach ($name in @("ffmpeg.exe", "ffprobe.exe", "node.exe", "yt-dlp.exe")) {
-    if (-not (Test-Path (Join-Path $binDir $name))) { throw "bin\$name is missing from the build." }
-}
-foreach ($leak in @("cookies.txt", "settings.json")) {
-    $found = Get-ChildItem -Path $appDir -Recurse -Filter $leak -ErrorAction SilentlyContinue
-    if ($found) { throw "Refusing to ship $leak found in the build: $($found[0].FullName)" }
-}
+# Safety check on the finished exe: the four tools and the icon are inside,
+# and no cookies.txt or settings.json was swept in.
+Invoke-Checked "Checking the exe contents" { & $python $helper check-exe $exe }
 
-$zip = Join-Path $distRoot "$appName-$version.zip"
-Invoke-Checked "Creating the zip" { & $python $helper zip $appDir $zip }
+$hash = (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash.ToLowerInvariant()
+[System.IO.File]::WriteAllText($hashFile, "$hash  $appName.exe`n", [System.Text.Encoding]::ASCII)
 
-$folderBytes = (Get-ChildItem -Path $appDir -Recurse -File | Measure-Object -Property Length -Sum).Sum
 Write-Host ""
-Write-Host ("App folder: {0} ({1:N1} MB)" -f $appDir, ($folderBytes / 1MB)) -ForegroundColor Green
-Write-Host ("Zip:        {0} ({1:N1} MB)" -f $zip, ((Get-Item $zip).Length / 1MB)) -ForegroundColor Green
+Write-Host ("App:    {0} ({1:N1} MB)" -f $exe, ((Get-Item $exe).Length / 1MB)) -ForegroundColor Green
+Write-Host ("SHA256: {0}" -f $hash) -ForegroundColor Green

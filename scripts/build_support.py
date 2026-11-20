@@ -5,13 +5,17 @@ Usage (from the project folder):
       print APP_VERSION from core/version.py
   python scripts/build_support.py version-info OUT
       write the PyInstaller version resource for APP_VERSION
-  python scripts/build_support.py icon PNG OUT
-      write a multi-size .ico (pads the PNG to a square; needs Pillow)
-  python scripts/build_support.py zip FOLDER OUT
-      zip FOLDER (as one top-level folder) into OUT, replacing OUT
+  python scripts/build_support.py icon LOGO OUT
+      write a multi-size .ico (trims transparent margins, pads to a square;
+      needs Pillow)
+  python scripts/build_support.py icon-sheet ICO OUT
+      render the small icon sizes on light and dark backgrounds (a PNG)
   python scripts/build_support.py ytdlp FOLDER
       download the latest official yt-dlp.exe into FOLDER, verified against
       the release's SHA2-256SUMS (core/updater.py); exit code 1 on any problem
+  python scripts/build_support.py check-exe EXE
+      list what the one-file exe contains; exit code 1 if a required file is
+      missing or a private file (cookies.txt, settings.json) is inside
 
 Only the ``ytdlp`` command uses the network.
 """
@@ -35,6 +39,12 @@ from core.version import APP_VERSION  # noqa: E402
 PRODUCT_NAME = "YouTube to MP3 Converter"
 EXE_BASENAME = "YouTubeMP3Converter"
 ICON_SIZES = (16, 20, 24, 32, 40, 48, 64, 128, 256)
+SHEET_SIZES = (16, 20, 24, 32, 48)
+# Pixels at or below this alpha (about 3 %) are invisible; they count as
+# transparent margin when trimming (photo cut-outs often keep a faint halo).
+TRIM_ALPHA = 8
+REQUIRED_IN_EXE = ("bin/ffmpeg.exe", "bin/ffprobe.exe", "bin/node.exe", "bin/yt-dlp.exe", "icon/app.ico")
+PRIVATE_NAMES = ("cookies.txt", "settings.json")
 
 
 # --- version resource -----------------------------------------------------------
@@ -89,14 +99,15 @@ def write_version_info(out: Path, version: str = APP_VERSION) -> None:
 # --- icon -------------------------------------------------------------------------
 
 
-def square_image(image):
-    """Trim fully transparent margins, then pad (never crop the picture) to a
-    square on a transparent background, centered: the artwork fills as much
-    of each icon size as its shape allows."""
+def square_image(image, trim_alpha: int = TRIM_ALPHA):
+    """Trim transparent margins (alpha <= ``trim_alpha``), then pad to a
+    square on a transparent background, centered. Never stretches and never
+    cuts into the visible picture: it fills as much of each size as its
+    shape allows."""
     from PIL import Image
 
     image = image.convert("RGBA")
-    box = image.getchannel("A").getbbox()
+    box = image.getchannel("A").point(lambda value: 255 if value > trim_alpha else 0).getbbox()
     if box:
         image = image.crop(box)
     side = max(image.size)
@@ -123,6 +134,38 @@ def write_icon(png: Path, out: Path, sizes: tuple[int, ...] = ICON_SIZES) -> lis
     if stored != expected:
         raise RuntimeError(f"icon sizes {stored} != {expected}")
     return stored
+
+
+def write_icon_sheet(ico: Path, out: Path, sizes: tuple[int, ...] = SHEET_SIZES, zoom: int = 6) -> None:
+    """Each size at 1:1 and enlarged (nearest neighbour, to see the real
+    pixels), on a light and a dark background."""
+    from PIL import Image, ImageDraw
+
+    backgrounds = (("light", (243, 243, 243)), ("dark", (32, 32, 32)))
+    pad, label_h = 12, 18
+    with Image.open(ico) as icon:
+        frames = {}
+        for size in sizes:
+            icon.size = (size, size)
+            frames[size] = icon.copy().convert("RGBA")
+    cell_w = max(sizes) * zoom + pad
+    width = pad + len(sizes) * cell_w
+    row_h = label_h + max(sizes) + pad + max(sizes) * zoom + pad
+    sheet = Image.new("RGB", (width, len(backgrounds) * row_h), (255, 255, 255))
+    draw = ImageDraw.Draw(sheet)
+    for row, (name, color) in enumerate(backgrounds):
+        top = row * row_h
+        draw.rectangle((0, top, width, top + row_h - 1), fill=color)
+        text = (0, 0, 0) if name == "light" else (230, 230, 230)
+        for column, size in enumerate(sizes):
+            x = pad + column * cell_w
+            draw.text((x, top + 3), f"{size} px ({name})", fill=text)
+            frame = frames[size]
+            sheet.paste(frame, (x, top + label_h), frame)
+            big = frame.resize((size * zoom, size * zoom), Image.Resampling.NEAREST)
+            sheet.paste(big, (x, top + label_h + max(sizes) + pad), big)
+    Path(out).parent.mkdir(parents=True, exist_ok=True)
+    sheet.save(out)
 
 
 # --- yt-dlp.exe ---------------------------------------------------------------------
@@ -171,21 +214,24 @@ def fetch_ytdlp(
     return target, result.version
 
 
-# --- zip ----------------------------------------------------------------------------
+# --- the built exe ----------------------------------------------------------------
 
 
-def write_zip(folder: Path, out: Path) -> int:
-    """Zip ``folder`` so it unpacks as one folder; returns the file count."""
-    import zipfile
+def exe_contents(exe: Path) -> list[str]:
+    """Names stored in a PyInstaller one-file exe, with forward slashes."""
+    from PyInstaller.archive.readers import CArchiveReader
 
-    folder, out = Path(folder), Path(out)
-    files = sorted(path for path in folder.rglob("*") if path.is_file())
-    temp = out.with_name(out.name + ".partial")
-    with zipfile.ZipFile(temp, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
-        for path in files:
-            archive.write(path, (Path(folder.name) / path.relative_to(folder)).as_posix())
-    temp.replace(out)
-    return len(files)
+    return sorted(name.replace("\\", "/") for name in CArchiveReader(str(exe)).toc)
+
+
+def check_contents(names: list[str]) -> list[str]:
+    """Problems with a one-file exe's contents (empty list = fine)."""
+    lowered = {name.lower() for name in names}
+    problems = [f"missing {name}" for name in REQUIRED_IN_EXE if name.lower() not in lowered]
+    for name in names:
+        if name.lower().rsplit("/", 1)[-1] in PRIVATE_NAMES:
+            problems.append(f"private file inside: {name}")
+    return problems
 
 
 # --- command line -------------------------------------------------------------------
@@ -202,11 +248,13 @@ def main(
     info = commands.add_parser("version-info")
     info.add_argument("out", type=Path)
     icon = commands.add_parser("icon")
-    icon.add_argument("png", type=Path)
+    icon.add_argument("logo", type=Path)
     icon.add_argument("out", type=Path)
-    zipped = commands.add_parser("zip")
-    zipped.add_argument("folder", type=Path)
-    zipped.add_argument("out", type=Path)
+    sheet = commands.add_parser("icon-sheet")
+    sheet.add_argument("ico", type=Path)
+    sheet.add_argument("out", type=Path)
+    check = commands.add_parser("check-exe")
+    check.add_argument("exe", type=Path)
     ytdlp = commands.add_parser("ytdlp")
     ytdlp.add_argument("folder", type=Path)
     args = parser.parse_args(argv)
@@ -217,11 +265,20 @@ def main(
         write_version_info(args.out)
         print(f"Version resource for {APP_VERSION}: {args.out}")
     elif args.command == "icon":
-        sizes = write_icon(args.png, args.out)
+        sizes = write_icon(args.logo, args.out)
         print(f"Icon with sizes {', '.join(str(w) for w, _ in sizes)}: {args.out}")
-    elif args.command == "zip":
-        count = write_zip(args.folder, args.out)
-        print(f"Zipped {count} files: {args.out}")
+    elif args.command == "icon-sheet":
+        write_icon_sheet(args.ico, args.out)
+        print(f"Icon sheet: {args.out}")
+    elif args.command == "check-exe":
+        names = exe_contents(args.exe)
+        problems = check_contents(names)
+        if problems:
+            for problem in problems:
+                print(f"ERROR: {problem}", file=sys.stderr)
+            return 1
+        tools = ", ".join(name for name in names if name.startswith("bin/"))
+        print(f"{args.exe}: {len(names)} embedded files; tools: {tools}; no cookies.txt or settings.json")
     elif args.command == "ytdlp":
         try:
             path, version = fetch_ytdlp(args.folder, opener, command_for)

@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import Callable, Protocol
 from urllib.parse import urlsplit
 
-from core.converter import CREATE_NO_WINDOW, kill_process_tree
+from core.converter import CREATE_NO_WINDOW, child_env, kill_process_tree
 
 REPO = "yt-dlp/yt-dlp"
 LATEST_RELEASE_URL = f"https://api.github.com/repos/{REPO}/releases/latest"
@@ -174,6 +174,7 @@ def read_version(
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             creationflags=CREATE_NO_WINDOW,
+            env=child_env(),
         )
     except (OSError, ValueError):
         return None

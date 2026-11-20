@@ -8,7 +8,6 @@ import contextlib
 import io
 import tempfile
 import unittest
-import zipfile
 from pathlib import Path
 
 from core.version import APP_VERSION
@@ -107,21 +106,24 @@ class FetchYtdlpTests(unittest.TestCase):
         self.assertFalse((self.folder / "yt-dlp.exe").exists())
 
 
-class ZipTests(unittest.TestCase):
-    def test_zip_holds_one_top_folder(self):
-        with tempfile.TemporaryDirectory() as temp:
-            app = Path(temp) / "YouTubeMP3Converter"
-            (app / "bin").mkdir(parents=True)
-            (app / "YouTubeMP3Converter.exe").write_bytes(b"exe")
-            (app / "bin" / "node.exe").write_bytes(b"node")
-            out = Path(temp) / "app.zip"
-            out.write_bytes(b"old")
-            self.assertEqual(build_support.write_zip(app, out), 2)
-            with zipfile.ZipFile(out) as archive:
-                self.assertEqual(
-                    sorted(archive.namelist()),
-                    ["YouTubeMP3Converter/YouTubeMP3Converter.exe", "YouTubeMP3Converter/bin/node.exe"],
-                )
+class ExeCheckTests(unittest.TestCase):
+    GOOD = [
+        "PYZ.pyz", "main", "bin/ffmpeg.exe", "bin/ffprobe.exe", "bin/node.exe", "bin/yt-dlp.exe",
+        "icon/app.ico", "PySide6/Qt6Core.dll",
+    ]
+
+    def test_complete_exe_passes(self):
+        self.assertEqual(build_support.check_contents(self.GOOD), [])
+
+    def test_missing_tool_fails(self):
+        names = [n for n in self.GOOD if n != "bin/node.exe"]
+        self.assertEqual(build_support.check_contents(names), ["missing bin/node.exe"])
+
+    def test_private_files_fail(self):
+        for leak in ("cookies.txt", "sub/Cookies.TXT", "settings.json"):
+            with self.subTest(leak=leak):
+                problems = build_support.check_contents([*self.GOOD, leak])
+                self.assertEqual(problems, [f"private file inside: {leak}"])
 
 
 class IconTests(unittest.TestCase):
@@ -129,7 +131,7 @@ class IconTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             base = Path(temp)
             (base / "icon").mkdir()
-            self.assertEqual(icon_path(base), base / "icon" / "icon1.png")
+            self.assertEqual(icon_path(base), base / "icon" / "logo.png")
             (base / "icon" / "app.ico").write_bytes(b"")
             self.assertEqual(icon_path(base), base / "icon" / "app.ico")
 
@@ -150,6 +152,36 @@ class IconTests(unittest.TestCase):
             self.assertEqual(square.size, (31, 31))
             self.assertEqual(square.getpixel((15, 30))[3], 0)  # padded, not stretched
             self.assertEqual(square.getpixel((15, 0))[3], 255)
+
+    def test_invisible_halo_is_trimmed_but_never_visible_pixels(self):
+        try:
+            from PIL import Image
+        except ImportError:
+            self.skipTest("Pillow is a build requirement")
+        image = Image.new("RGBA", (100, 100), (0, 0, 0, 0))
+        image.putpixel((0, 0), (255, 255, 255, build_support.TRIM_ALPHA))  # faint halo pixel
+        image.putpixel((99, 99), (255, 255, 255, build_support.TRIM_ALPHA + 1))  # visible
+        image.paste((0, 0, 255, 255), (40, 10, 60, 90))
+        square = build_support.square_image(image)
+        self.assertEqual(square.size, (90, 90))  # (40,10)-(100,100) = 60 x 90 kept, padded
+        self.assertEqual(square.getpixel((15 + 59, 89))[3], build_support.TRIM_ALPHA + 1)
+
+    def test_icon_sheet_renders(self):
+        try:
+            from PIL import Image
+        except ImportError:
+            self.skipTest("Pillow is a build requirement")
+        with tempfile.TemporaryDirectory() as temp:
+            png = Path(temp) / "logo.png"
+            Image.new("RGBA", (64, 80), (200, 0, 0, 255)).save(png)
+            ico = Path(temp) / "app.ico"
+            build_support.write_icon(png, ico)
+            out = Path(temp) / "sheet" / "icon_sheet.png"
+            build_support.write_icon_sheet(ico, out)
+            with Image.open(out) as sheet:
+                self.assertGreater(sheet.width, 48 * len(build_support.SHEET_SIZES))
+                self.assertEqual(sheet.getpixel((2, 2)), (243, 243, 243))
+                self.assertEqual(sheet.getpixel((2, sheet.height - 2)), (32, 32, 32))
 
     def test_transparent_margins_are_trimmed_before_padding(self):
         try:

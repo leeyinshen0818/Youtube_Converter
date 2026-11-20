@@ -279,8 +279,27 @@ def remove_dir(path: Path, attempts: int = 10, delay: float = 0.2) -> bool:
     return not path.exists()
 
 
+def child_env(base: dict[str, str] | None = None) -> dict[str, str]:
+    """Environment for programs the app starts (yt-dlp, which starts ffmpeg
+    and node).
+
+    The one-file exe's bootloader leaves ``_PYI_*`` variables behind; yt-dlp.exe
+    is itself a PyInstaller one-file program and would take them as its own
+    and look for its files in this app's temporary folder. PyInstaller's
+    documented fix is ``PYINSTALLER_RESET_ENVIRONMENT=1``; the variables are
+    also dropped.
+    """
+    env = {
+        key: value
+        for key, value in (os.environ if base is None else base).items()
+        if not key.upper().startswith("_PYI_") and key.upper() != "_MEIPASS2"
+    }
+    env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
+    return env
+
+
 def _subprocess_env() -> dict[str, str]:
-    env = dict(os.environ)
+    env = child_env()
     env["PYTHONIOENCODING"] = "utf-8"
     env["PYTHONUNBUFFERED"] = "1"
     return env
