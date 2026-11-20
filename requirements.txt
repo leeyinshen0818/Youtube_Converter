@@ -1,1 +1,2 @@
 yt-dlp[default]>=2026.8.19
+PySide6==6.12.0
