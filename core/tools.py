@@ -130,11 +130,22 @@ def _on_path(env: ToolEnvironment, name: str) -> Path | None:
     return path if _is_file(path) else None
 
 
+def bundled_bin_dirs(env: ToolEnvironment) -> list[Path]:
+    """``bin`` next to the app (the built onedir folder, or the source folder),
+    then ``bin`` inside PyInstaller's bundle folder (``_internal``)."""
+    dirs = [env.app_dir / BUNDLED_BIN, env.bundle_dir / BUNDLED_BIN]
+    return dirs if dirs[0] != dirs[1] else dirs[:1]
+
+
+def _bundled(env: ToolEnvironment, exe: str) -> Path | None:
+    return _first_file([folder / exe for folder in bundled_bin_dirs(env)])
+
+
 def _find_media_tool(env: ToolEnvironment, name: str) -> Path | None:
-    """Bundled copy, then PATH, then the WinGet links folder (same as app.py)."""
+    """Copy shipped with the app, then PATH, then the WinGet links folder."""
     exe = f"{name}.exe"
     return (
-        _first_file([env.bundle_dir / BUNDLED_BIN / exe])
+        _bundled(env, exe)
         or _on_path(env, name)
         or _first_file([winget_links_dir(env) / exe])
     )
@@ -149,16 +160,12 @@ def find_ffprobe(env: ToolEnvironment) -> Path | None:
 
 
 def find_node(env: ToolEnvironment) -> Path | None:
-    """Bundled copy, then PATH (same as app.py)."""
-    return _first_file([env.bundle_dir / BUNDLED_BIN / "node.exe"]) or _on_path(env, "node")
+    """Copy shipped with the app, then PATH (no WinGet fallback)."""
+    return _bundled(env, "node.exe") or _on_path(env, "node")
 
 
 def bundled_ytdlp_candidates(env: ToolEnvironment) -> list[Path]:
-    return [
-        env.app_dir / "yt-dlp.exe",
-        env.app_dir / BUNDLED_BIN / "yt-dlp.exe",
-        env.bundle_dir / BUNDLED_BIN / "yt-dlp.exe",
-    ]
+    return [env.app_dir / "yt-dlp.exe", *(folder / "yt-dlp.exe" for folder in bundled_bin_dirs(env))]
 
 
 def find_ytdlp(env: ToolEnvironment) -> Path | None:

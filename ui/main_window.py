@@ -93,9 +93,6 @@ def clean_folder(folder: Path | None) -> None:
                 pass
 
 
-# Kept for callers from Stage 3b.
-clean_temp_root = clean_folder
-
 
 class ShellActions:
     """Explorer integration (replaced by a fake in tests)."""

@@ -133,6 +133,46 @@ class ToolLookupTests(unittest.TestCase):
         self.assertEqual(found.missing, [])
         self.assertEqual(found.ytdlp, self.bundle / "bin" / "yt-dlp.exe")
 
+    def test_bin_next_to_app_comes_before_bundle_bin(self):
+        for name, finder in (
+            ("ffmpeg", tools.find_ffmpeg),
+            ("ffprobe", tools.find_ffprobe),
+            ("node", tools.find_node),
+            ("yt-dlp", tools.find_ytdlp),
+        ):
+            with self.subTest(name=name):
+                self.touch(self.path_dir / f"{name}.exe")
+                inside = self.touch(self.bundle / "bin" / f"{name}.exe")
+                self.assertEqual(finder(self.env), inside)
+                beside = self.touch(self.app / "bin" / f"{name}.exe")
+                self.assertEqual(finder(self.env), beside)
+
+    def test_same_app_and_bundle_dir_is_checked_once(self):
+        env = ToolEnvironment(self.app, self.app, self.local, self.home, self.fake_which)
+        self.assertEqual(tools.bundled_bin_dirs(env), [self.app / "bin"])
+
+    def test_built_onedir_layout_finds_all_four_tools(self):
+        """PyInstaller 6 onedir: <app>\\YouTubeMP3Converter.exe, <app>\\_internal
+        (sys._MEIPASS) and the tools in <app>\\bin (copied by build_windows.ps1)."""
+        app_root = self.app / "YouTubeMP3Converter"
+        exe = self.touch(app_root / "YouTubeMP3Converter.exe")
+        internal = app_root / "_internal"
+        internal.mkdir()
+        for name in ("ffmpeg", "ffprobe", "node", "yt-dlp"):
+            self.touch(app_root / "bin" / f"{name}.exe")
+        with patch.object(tools.sys, "frozen", True, create=True), \
+                patch.object(tools.sys, "executable", str(exe)), \
+                patch.object(tools.sys, "_MEIPASS", str(internal), create=True), \
+                patch.dict("os.environ", {"LOCALAPPDATA": str(self.local)}):
+            env = tools.default_environment()
+        self.assertEqual(env.app_dir, app_root.resolve())
+        self.assertEqual(env.bundle_dir, internal)
+        env = ToolEnvironment(env.bundle_dir, env.app_dir, self.local, self.home, lambda _name: None)
+        found = tools.locate_tools(env)
+        self.assertEqual(found.missing, [])
+        for path in (found.ffmpeg, found.ffprobe, found.node, found.ytdlp):
+            self.assertEqual(path.parent, app_root.resolve() / "bin")
+
     def test_default_environment_uses_localappdata(self):
         with patch.dict("os.environ", {"LOCALAPPDATA": self.local.as_posix()}):
             env = tools.default_environment()

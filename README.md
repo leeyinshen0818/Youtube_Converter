@@ -1,47 +1,85 @@
-# YouTube to MP3 Batch Converter
+# YouTube to MP3 Converter
 
-A local app for converting YouTube links to MP3 in batches. Current version: **v1.1.0**.
+A small Windows app that turns YouTube video links into MP3 files.
 
-Use it only for videos you own, public-domain or Creative Commons content, or material you have permission to download.
+Use it only for videos you own, public-domain content, Creative Commons
+content, or material you have permission to download.
 
-## Use the Windows App
+## How to use
 
-Open `dist\YouTubeMP3Converter.exe`. It opens the converter in your browser and stays in the system tray. You can copy the single `.exe` to your Desktop or another Windows computer; Python, FFmpeg, FFprobe, Node.js, and yt-dlp are bundled.
+1. **Paste links**: one YouTube video link per line, up to 50 at a time.
+   Playlist and channel links are skipped; paste the single videos instead.
+2. **Convert**: each link gets a row that shows its progress.
+3. **Download**: press **Download** on a finished row, or **Download All**.
+   **Show in folder** then opens the saved file.
 
-To rebuild it on Windows, run `./build_windows.ps1` in PowerShell. Close any running copies of the app first so the executable can be replaced.
+## Where your files go
 
-## Run from Source
+- MP3s are saved in `Downloads\YouTube MP3 Converter` unless you choose
+  another folder in **Settings**.
+- Until you press Download, converted files wait in
+  `%LOCALAPPDATA%\YouTube MP3 Converter\ready`. The app's settings and its
+  updated download component are also kept in
+  `%LOCALAPPDATA%\YouTube MP3 Converter`.
 
-Install Python 3.10 or newer, Node.js 22 or newer, and FFmpeg. FFmpeg must be on `PATH` (`winget install Gyan.FFmpeg` on Windows; reopen your terminal afterward).
+## Settings and Update
 
-From this folder in PowerShell:
+- **Settings** (top right): change the save folder and see the version
+  numbers. Cookies are under **Advanced**.
+- **Downloads not working? Update** (bottom of the window): YouTube changes
+  often. If downloads stop working, this installs the newest official
+  `yt-dlp.exe`, the part that does the downloading. The download is checked
+  against the official checksums before it replaces the old one.
+
+## Cookies (optional)
+
+You usually don't need cookies. Import a `cookies.txt` file under
+**Settings > Advanced** only if YouTube asks you to sign in. The file holds
+your login session, so keep it private and never share it.
+
+## Run from source
+
+Requires Windows and Python 3.10 or newer.
 
 ```powershell
 python -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt
-.\.venv\Scripts\python.exe app.py
+.venv\Scripts\python -m pip install -r requirements-dev.txt
+.venv\Scripts\python main.py
 ```
 
-The app opens in your browser at `http://127.0.0.1:8080`. To use VS Code's Run button, select `.\.venv\Scripts\python.exe` with **Python: Select Interpreter** first.
+The app needs `yt-dlp.exe`, `ffmpeg.exe`, `ffprobe.exe` and `node.exe`. It
+looks for them in a `bin` folder next to `main.py`, then on `PATH`. If
+`yt-dlp.exe` is missing, use **Downloads not working? Update** to install it.
 
-## Convert and Manage the Queue
+Run the tests. They don't use the network or the real app folders:
 
-1. Paste a YouTube link. Press Enter for another link, or paste multiple links at once.
-2. Click **Convert Batch**. New batches stay in the queue with earlier results.
-3. Download an MP3 from its row, or use **Download All** for all available completed MP3s in the visible queue.
+```powershell
+.venv\Scripts\python -m unittest discover -s . -t .
+```
 
-**Stop** cancels a waiting item immediately or requests cancellation of a running item. **Retry** is available for failed or stopped items. **Clear Links** empties the input fields. **Clear List** asks for confirmation and removes completed, failed, and stopped rows; active conversions stay visible. Clearing the list does not delete MP3 files.
+## Build the Windows app
 
-Source downloads are saved in `downloads/`. Standalone app downloads are saved in `%USERPROFILE%\Downloads\YouTube MP3 Converter`.
+You need `ffmpeg`, `ffprobe` and `node` on `PATH`, plus the `.venv` from
+above. Then run:
 
-## YouTube Cookies
+```powershell
+powershell -ExecutionPolicy Bypass -File .\build_windows.ps1
+```
 
-If YouTube requires sign-in for a video, export your own cookies in Netscape format as `cookies.txt`. Put it beside `app.py` when running from source, or in `%LOCALAPPDATA%\YouTube MP3 Converter\` for the Windows app. Restart the app after replacing it. Never share or commit `cookies.txt`; it contains private session information and is ignored by Git.
+The script:
 
-## Limits
+- installs `requirements.txt` and `requirements-build.txt`;
+- downloads the latest official `yt-dlp.exe` and checks it against the
+  release's `SHA2-256SUMS` (the build stops on any mismatch);
+- copies `ffmpeg`, `ffprobe` and `node` from `PATH`;
+- writes the icon and the version resource (the version comes from
+  `core\version.py`).
 
-- Up to 50 links per batch, with two conversions running at a time. Playlists are not downloaded in full.
-- Queue history and download indicators last only until the app closes. MP3 files remain on disk.
-- A running item may take a moment to stop while yt-dlp finishes a network request or FFmpeg step.
-- The app marks a file as downloaded after serving it to the browser. It cannot confirm that the browser saved it. Browsers may also ask permission for multiple downloads.
-- Missing MP3 files are shown as unavailable and excluded from Download All. Some YouTube videos require cookies or take longer because of YouTube checks.
+Results:
+
+- `dist\YouTubeMP3Converter\`: the app folder. Run
+  `YouTubeMP3Converter.exe`; the four tools are in `bin\`.
+- `dist\YouTubeMP3Converter-<version>.zip`: the same folder, zipped for sharing.
+
+The built app doesn't need Python. The exe isn't code-signed, so Windows
+SmartScreen may warn the first time it runs.

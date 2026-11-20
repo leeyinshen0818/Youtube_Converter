@@ -1,0 +1,7 @@
+# Running from source and running the tests.
+-r requirements.txt
+
+# Optional: puts a yt-dlp on PATH for `python main.py` on a machine that has
+# no other yt-dlp.exe (the app normally uses the copy installed by its Update
+# dialog). Not needed for the tests, which never run the real yt-dlp.
+# yt-dlp[default]>=2026.8.19

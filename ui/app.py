@@ -23,8 +23,12 @@ def resource_dir() -> Path:
     return Path(bundle) if bundle else Path(__file__).resolve().parent.parent
 
 
-def icon_path() -> Path:
-    return resource_dir() / "icon" / "icon1.png"
+def icon_path(base: Path | None = None) -> Path:
+    """The multi-size .ico made by the build (sharp at every scale), else the
+    source PNG (running from source)."""
+    folder = (base or resource_dir()) / "icon"
+    ico = folder / "app.ico"
+    return ico if ico.is_file() else folder / "icon1.png"
 
 
 def main(argv: list[str] | None = None) -> int:

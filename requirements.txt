@@ -1,2 +1,2 @@
-yt-dlp[default]>=2026.8.19
-PySide6==6.12.0
+# What the app needs at run time (Qt Core/Gui/Widgets only; no WebEngine).
+PySide6-Essentials==6.12.0
